@@ -1,0 +1,15 @@
+# User and generated financial data must never be committed.
+data/
+reports/
+*.xlsx
+*.csv
+*.zip
+
+# Local dependencies and interpreter output.
+node_modules/
+__pycache__/
+*.py[cod]
+
+# Local-only launch helpers and secrets.
+.env
+*.log

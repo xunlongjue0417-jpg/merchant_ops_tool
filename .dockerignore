@@ -1,0 +1,15 @@
+.git
+.gitignore
+data/
+reports/
+node_modules/
+__pycache__/
+*.xlsx
+*.csv
+*.zip
+*.log
+run.ps1
+启动工具.cmd
+设置开机后台运行.cmd
+后台运行.vbs
+build_augmented_income.mjs
