@@ -84,7 +84,11 @@ def token_cipher():
     if not Fernet or not TIKTOK_TOKEN_ENCRYPTION_KEY:
         return None
     try:
-        return Fernet(TIKTOK_TOKEN_ENCRYPTION_KEY.encode("ascii"))
+        raw = TIKTOK_TOKEN_ENCRYPTION_KEY.strip().encode("utf-8")
+        # Render's Generate action may return a regular secret rather than a
+        # Fernet key. Derive a fixed 32-byte key without exposing the secret.
+        key = raw if len(raw) == 44 else base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
+        return Fernet(key)
     except Exception:
         return None
 
