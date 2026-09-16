@@ -50,6 +50,7 @@ STATE_PATH = DATA / "state.json"
 ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "")
 TIKTOK_APP_KEY = os.environ.get("TIKTOK_APP_KEY", "")
 TIKTOK_APP_SECRET = os.environ.get("TIKTOK_APP_SECRET", "")
+TIKTOK_SERVICE_ID = os.environ.get("TIKTOK_SERVICE_ID", "")
 TIKTOK_TOKEN_ENCRYPTION_KEY = os.environ.get("TIKTOK_TOKEN_ENCRYPTION_KEY", "")
 TIKTOK_REDIRECT_URL = os.environ.get("TIKTOK_REDIRECT_URL", "https://erp-sistem.onrender.com/tiktok/callback")
 LOCAL_NODE = Path(r"C:\Users\Win10\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
@@ -742,12 +743,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.require_access():
             return
         if parsed.path == "/tiktok/authorize":
-            if not TIKTOK_APP_KEY or not TIKTOK_APP_SECRET or not token_cipher():
+            if not TIKTOK_APP_KEY or not TIKTOK_APP_SECRET or not TIKTOK_SERVICE_ID or not token_cipher():
                 self.json({"error": "TikTok API 尚未完成安全配置。"}, HTTPStatus.SERVICE_UNAVAILABLE)
                 return
             auth_state = secrets.token_urlsafe(32)
             save_oauth_state(auth_state)
-            query = urlencode({"service_id": TIKTOK_APP_KEY, "state": auth_state})
+            query = urlencode({"service_id": TIKTOK_SERVICE_ID, "state": auth_state})
             location = f"https://services.tiktokshop.com/open/authorize?{query}"
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", location)
