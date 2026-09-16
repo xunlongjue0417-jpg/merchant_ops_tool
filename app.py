@@ -15,6 +15,7 @@ import json
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import uuid
@@ -25,7 +26,9 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 try:
     import xlsxwriter
@@ -34,12 +37,21 @@ except ModuleNotFoundError:
     # Render installs XlsxWriter from requirements.txt instead.
     xlsxwriter = None
 
+try:
+    from cryptography.fernet import Fernet
+except ModuleNotFoundError:
+    Fernet = None
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 REPORTS = ROOT / "reports"
 STATIC = ROOT / "static"
 STATE_PATH = DATA / "state.json"
 ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "")
+TIKTOK_APP_KEY = os.environ.get("TIKTOK_APP_KEY", "")
+TIKTOK_APP_SECRET = os.environ.get("TIKTOK_APP_SECRET", "")
+TIKTOK_TOKEN_ENCRYPTION_KEY = os.environ.get("TIKTOK_TOKEN_ENCRYPTION_KEY", "")
+TIKTOK_REDIRECT_URL = os.environ.get("TIKTOK_REDIRECT_URL", "https://erp-sistem.onrender.com/tiktok/callback")
 LOCAL_NODE = Path(r"C:\Users\Win10\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
 
 
@@ -57,6 +69,67 @@ def state():
 def save_state(value):
     DATA.mkdir(exist_ok=True)
     STATE_PATH.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def auth_db():
+    """Temporary local storage for development only; production needs a persistent DB."""
+    DATA.mkdir(exist_ok=True)
+    connection = sqlite3.connect(DATA / "tiktok_auth.db")
+    connection.execute("CREATE TABLE IF NOT EXISTS oauth_states (value TEXT PRIMARY KEY, created_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS shop_tokens (shop_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    return connection
+
+
+def token_cipher():
+    if not Fernet or not TIKTOK_TOKEN_ENCRYPTION_KEY:
+        return None
+    try:
+        return Fernet(TIKTOK_TOKEN_ENCRYPTION_KEY.encode("ascii"))
+    except Exception:
+        return None
+
+
+def save_oauth_state(value):
+    with auth_db() as connection:
+        connection.execute("DELETE FROM oauth_states WHERE created_at < strftime('%s','now') - 900")
+        connection.execute("INSERT INTO oauth_states(value, created_at) VALUES (?, strftime('%s','now'))", (value,))
+
+
+def consume_oauth_state(value):
+    with auth_db() as connection:
+        row = connection.execute("SELECT value FROM oauth_states WHERE value=? AND created_at >= strftime('%s','now') - 900", (value,)).fetchone()
+        if not row:
+            return False
+        connection.execute("DELETE FROM oauth_states WHERE value=?", (value,))
+        return True
+
+
+def exchange_tiktok_code(code):
+    """Exchange a one-time TikTok authorization code without ever exposing the secret."""
+    if not TIKTOK_APP_KEY or not TIKTOK_APP_SECRET:
+        raise RuntimeError("TikTok App Key 或 App Secret 尚未配置。")
+    query = urlencode({"app_key": TIKTOK_APP_KEY, "app_secret": TIKTOK_APP_SECRET, "auth_code": code, "grant_type": "authorized_code"})
+    request = Request(f"https://auth.tiktok-shops.com/api/v2/token/get?{query}", headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as error:
+        raise RuntimeError("TikTok Token 服务暂时不可用，请稍后重试。") from error
+    if result.get("code") not in (0, "0", None) or not result.get("data"):
+        raise RuntimeError("TikTok 未接受授权码。")
+    return result["data"]
+
+
+def save_shop_token(token_data):
+    cipher = token_cipher()
+    if not cipher:
+        raise RuntimeError("未配置 TIKTOK_TOKEN_ENCRYPTION_KEY，系统拒绝保存 Token。")
+    shop_key = text(token_data.get("open_id"))
+    if not shop_key:
+        raise RuntimeError("TikTok 未返回店铺授权标识。")
+    encrypted = cipher.encrypt(json.dumps(token_data, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    with auth_db() as connection:
+        connection.execute("INSERT OR REPLACE INTO shop_tokens(shop_key, payload, updated_at) VALUES (?, ?, strftime('%s','now'))", (shop_key, encrypted))
 
 
 def text(value):
@@ -663,6 +736,42 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
             return
         if not self.require_access():
+            return
+        if parsed.path == "/tiktok/authorize":
+            if not TIKTOK_APP_KEY or not TIKTOK_APP_SECRET or not token_cipher():
+                self.json({"error": "TikTok API 尚未完成安全配置。"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            auth_state = secrets.token_urlsafe(32)
+            save_oauth_state(auth_state)
+            query = urlencode({"service_id": TIKTOK_APP_KEY, "state": auth_state})
+            location = f"https://services.tiktokshop.com/open/authorize?{query}"
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if parsed.path == "/tiktok/callback":
+            params = parse_qs(parsed.query)
+            code = text((params.get("code") or params.get("auth_code") or [""])[0])
+            auth_state = text((params.get("state") or [""])[0])
+            error = text((params.get("error") or [""])[0])
+            if error or not code:
+                result, status = "<h2>TikTok 授权已取消或失败</h2><p>请返回系统重试。</p>", HTTPStatus.BAD_REQUEST
+            elif not consume_oauth_state(auth_state):
+                result, status = "<h2>授权请求已失效</h2><p>请回到系统重新开始授权。</p>", HTTPStatus.BAD_REQUEST
+            else:
+                try:
+                    save_shop_token(exchange_tiktok_code(code))
+                    result, status = "<h2>TikTok 店铺已安全连接</h2><p>可以关闭此页并返回系统。</p>", HTTPStatus.OK
+                except RuntimeError:
+                    result, status = "<h2>连接未完成</h2><p>系统没有保存任何 Token。请检查配置后重新授权。</p>", HTTPStatus.SERVICE_UNAVAILABLE
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            raw = ("<!doctype html><meta charset='utf-8'><title>TikTok 授权</title>" + result).encode("utf-8")
+            self.send_header("Content-Length", len(raw))
+            self.end_headers()
+            self.wfile.write(raw)
             return
         if parsed.path == "/api/state":
             current = state()

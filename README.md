@@ -43,6 +43,11 @@
 
 ## Render 测试部署
 
+TikTok OAuth 回调地址为 `https://erp-sistem.onrender.com/tiktok/callback`。完成 Partner Center 审核后，在 Render 的
+Environment Variables 中配置 `TIKTOK_APP_KEY`、`TIKTOK_APP_SECRET` 和 `TIKTOK_TOKEN_ENCRYPTION_KEY`；密钥不得提交到 GitHub。
+`TIKTOK_TOKEN_ENCRYPTION_KEY` 必须使用 Fernet 格式的随机密钥。当前实现会校验一次性 state、用 App Secret 交换授权码，并加密保存 Token。
+Render 免费实例没有持久磁盘，重启会丢失本地 Token。因此，在接入真实店铺或多人使用前，必须迁移到持久数据库与付费/持久化部署方案。
+
 本项目可部署为单用户测试网站。Render 使用根目录的 `Dockerfile` 自动安装 Python 依赖并启动服务。
 
 在 Render 创建 **Web Service** 后：

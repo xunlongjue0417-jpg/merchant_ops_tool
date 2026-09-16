@@ -1,1 +1,2 @@
 XlsxWriter==3.2.9
+cryptography==46.0.3
