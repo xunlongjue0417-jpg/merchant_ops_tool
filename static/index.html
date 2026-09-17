@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-Hans"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>商家利润与库存工具</title><link rel="stylesheet" href="styles.css?v=20260911-3"></head>
 <body><main>
+<section id="tiktok-connect"><h2>TikTok Shop 连接</h2><p>每位用户都通过 TikTok 官方页面授权，不需要把店铺密码或密钥交给本网站。</p><button id="tiktok-connect-button" type="button">连接 TikTok Shop</button><p id="tiktok-status" class="sub">正在检查连接状态…</p></section>
 <h1>商家利润与库存工具 <small class="version">TikTok 版 · 2026.09.11</small></h1><p class="sub">本地运行 · 不收集 TikTok 密码 · 真实库存写入尚未启用</p>
 <section><h2>1. 核对 TikTok 纯利润</h2><p>Income 表提供最终到账；All Orders 表提供真实商品与数量。数量或成本不完整的订单会标为“需核对”，不会假装有利润。</p><details><summary>商品名称：查找并替换</summary><small>只改本系统和下载报告显示名称，不改 TikTok 原始订单。</small><form id="name-replace"><label>查找文字<input name="find" placeholder="例如 Women Sandals" required></label><label>替换为<input name="replace" placeholder="例如 Hikari 凉鞋"></label><button>全部替换</button></form></details>
 <form id="analyse"><label>Income（结算表）<input name="income" type="file" accept=".xlsx" required></label><label>All Orders（订单商品明细）<input name="orders" type="file" accept=".xlsx" required></label><button>分析</button></form><div id="summary"></div><p><a id="download" hidden href="/api/download/latest">下载 Excel：TikTok 结算表 + 利润栏位</a>　<a id="download-csv" hidden href="/api/download/csv">下载 CSV：当前订单结果</a></p><div id="missing"></div><div id="orders"></div></section>
