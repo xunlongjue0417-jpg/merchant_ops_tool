@@ -732,6 +732,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/healthz"):
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -754,6 +763,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", location)
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            return
+        if parsed.path == "/api/tiktok/status":
+            configured = bool(TIKTOK_APP_KEY and TIKTOK_APP_SECRET and TIKTOK_SERVICE_ID and token_cipher())
+            with auth_db() as connection:
+                authorized_shops = connection.execute("SELECT COUNT(*) FROM shop_tokens").fetchone()[0]
+            self.json({"configured": configured, "authorized_shops": authorized_shops})
             return
         if parsed.path == "/tiktok/callback":
             params = parse_qs(parsed.query)
