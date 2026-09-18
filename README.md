@@ -1,3 +1,4 @@
+[English Version](README_EN.md)
 # 商家利润与库存工具
 
 这是第一阶段的本地工具：不需要 TikTok 密码、不开服务器、不会改动线上商品。
