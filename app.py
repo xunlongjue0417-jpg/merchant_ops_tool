@@ -782,7 +782,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 try:
                     save_shop_token(exchange_tiktok_code(code))
-                    result, status = "<h2>TikTok 店铺已安全连接</h2><p>可以关闭此页并返回系统。</p>", HTTPStatus.OK
+                    result, status = "<h2>TikTok 店铺已安全连接</h2><p>正在返回 ERP 系统…</p><p><a href='/'>立即返回 ERP</a></p><script>window.setTimeout(function(){ window.location.replace('/'); }, 1200);</script>", HTTPStatus.OK
                 except RuntimeError:
                     result, status = "<h2>连接未完成</h2><p>系统没有保存任何 Token。请检查配置后重新授权。</p>", HTTPStatus.SERVICE_UNAVAILABLE
             self.send_response(status)
