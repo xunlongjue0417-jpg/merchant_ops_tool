@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
@@ -53,6 +54,7 @@ TIKTOK_APP_SECRET = os.environ.get("TIKTOK_APP_SECRET", "")
 TIKTOK_SERVICE_ID = os.environ.get("TIKTOK_SERVICE_ID", "")
 TIKTOK_TOKEN_ENCRYPTION_KEY = os.environ.get("TIKTOK_TOKEN_ENCRYPTION_KEY", "")
 TIKTOK_REDIRECT_URL = os.environ.get("TIKTOK_REDIRECT_URL", "https://erp-sistem.onrender.com/tiktok/callback")
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 LOCAL_NODE = Path(r"C:\Users\Win10\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
 
 
@@ -73,12 +75,45 @@ def save_state(value):
 
 
 def auth_db():
-    """Temporary local storage for development only; production needs a persistent DB."""
+    """Tenant-aware storage foundation; production should use a persistent database."""
     DATA.mkdir(exist_ok=True)
     connection = sqlite3.connect(DATA / "tiktok_auth.db")
+    connection.execute("CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, created_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS shops (shop_key TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, shop_name TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS user_shop_access (user_id TEXT NOT NULL, shop_key TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'owner', PRIMARY KEY(user_id, shop_key))")
     connection.execute("CREATE TABLE IF NOT EXISTS oauth_states (value TEXT PRIMARY KEY, created_at INTEGER NOT NULL)")
-    connection.execute("CREATE TABLE IF NOT EXISTS shop_tokens (shop_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS shop_tokens (shop_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL, user_id TEXT NOT NULL DEFAULT 'owner')")
+    connection.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(shop_tokens)").fetchall()}
+    if "user_id" not in columns:
+        connection.execute("ALTER TABLE shop_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
     return connection
+
+
+def password_hash(password, salt=None):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210_000)
+    return f"pbkdf2_sha256$210000${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+
+
+def password_matches(password, stored):
+    try:
+        algorithm, rounds, salt, expected = stored.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), base64.urlsafe_b64decode(salt), int(rounds))
+        return secrets.compare_digest(base64.urlsafe_b64encode(actual).decode(), expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def create_session(user_id):
+    session_id = secrets.token_urlsafe(32)
+    now = int(time.time())
+    with auth_db() as connection:
+        connection.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+        connection.execute("INSERT INTO sessions(session_id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (session_id, user_id, now + SESSION_TTL_SECONDS, now))
+    return session_id
 
 
 def token_cipher():
@@ -134,7 +169,10 @@ def save_shop_token(token_data):
         raise RuntimeError("TikTok 未返回店铺授权标识。")
     encrypted = cipher.encrypt(json.dumps(token_data, ensure_ascii=False).encode("utf-8")).decode("ascii")
     with auth_db() as connection:
-        connection.execute("INSERT OR REPLACE INTO shop_tokens(shop_key, payload, updated_at) VALUES (?, ?, strftime('%s','now'))", (shop_key, encrypted))
+        connection.execute("INSERT OR IGNORE INTO users(user_id, email, display_name, created_at) VALUES ('owner', 'owner@local.invalid', '店铺所有者', strftime('%s','now'))")
+        connection.execute("INSERT OR IGNORE INTO shops(shop_key, owner_user_id, shop_name, region, created_at, updated_at) VALUES (?, 'owner', ?, ?, strftime('%s','now'), strftime('%s','now'))", (shop_key, text(token_data.get("shop_name")), text(token_data.get("region"))))
+        connection.execute("INSERT OR REPLACE INTO user_shop_access(user_id, shop_key, role) VALUES ('owner', ?, 'owner')", (shop_key,))
+        connection.execute("INSERT OR REPLACE INTO shop_tokens(shop_key, payload, updated_at, user_id) VALUES (?, ?, strftime('%s','now'), 'owner')", (shop_key, encrypted))
 
 
 def text(value):
