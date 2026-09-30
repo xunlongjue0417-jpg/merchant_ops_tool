@@ -5,6 +5,9 @@ reports/
 *.csv
 *.zip
 
+# Public blank template (contains no merchant data).
+!cost_table_template.csv
+
 # Local dependencies and interpreter output.
 node_modules/
 __pycache__/
