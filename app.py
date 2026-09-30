@@ -823,7 +823,9 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
     orders = table(orders_path, "OrderSKUList", "Order ID")
     report_currency = detect_currency(income)
     original_headers = list(income[0].keys())
-    insert_at = original_headers.index("Total Revenue") + 1
+    # TikTok changes report columns between exports/regions. When the
+    # optional Total Revenue column is absent, append calculated columns.
+    insert_at = original_headers.index("Total Revenue") + 1 if "Total Revenue" in original_headers else len(original_headers)
     added = ["商品名称", "Variation", "实际数量", "成本", "纯利润", "核对状态"]
     headers = original_headers[:insert_at] + added + original_headers[insert_at:]
     by_order = defaultdict(list)
@@ -977,7 +979,11 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
 
     summary_row = len(rows) + 2
     worksheet.write(summary_row, order_index, "总计", total_label_format)
-    for index in (settlement_index, headers.index("Total Revenue"), cost_index, profit_index):
+    revenue_index = headers.index("Total Revenue") if "Total Revenue" in headers else None
+    summary_indexes = [settlement_index, cost_index, profit_index]
+    if revenue_index is not None:
+        summary_indexes.insert(1, revenue_index)
+    for index in summary_indexes:
         column = excel_column(index)
         worksheet.write_formula(summary_row, index, f"=SUM({column}2:{column}{len(rows) + 1})", total_format)
 
