@@ -41,7 +41,7 @@
   <section>
     <h2 data-i18n="step1Title">1. Review your profit</h2>
     <p data-i18n="step1Hint">The settlement report provides the money paid to you. The order-details report provides the products and quantities. Incomplete orders are marked Needs review instead of being presented as profitable.</p>
-    <details>
+    <details open>
       <summary data-i18n="renameSummary">Product names: find and replace</summary>
       <small data-i18n="renameHint">This only changes names shown in this tool and downloaded reports. Your original export is not changed.</small>
       <form id="name-replace"><label data-i18n="findText">Find text<input name="find" placeholder="e.g. Women Sandals" data-i18n-placeholder="findPlaceholder" required></label><label data-i18n="replaceText">Replace with<input name="replace" placeholder="e.g. Hikari Sandals" data-i18n-placeholder="replacePlaceholder"></label><button data-i18n="replaceButton">Replace all</button></form>
@@ -66,6 +66,6 @@
     <details><summary data-i18n="manualCostSummary">Manual cost entry (only for special cases)</summary><form id="cost"><label data-i18n="platformSkuLabel">Platform SKU ID<input name="sku_id" required></label><label data-i18n="unitCostLabel">Unit cost (RM)<input name="amount" type="number" min="0" step="0.01" required></label><label data-i18n="effectiveFromLabel">Effective date<input name="effective_from" placeholder="2026/08/01"></label><label data-i18n="noteLabel">Note<input name="note"></label><button data-i18n="saveCostButton">Save cost</button></form></details>
   </section>
 </main>
-<script src="app.js?v=20261001-2"></script>
+<script src="app.js?v=20261001-5"></script>
 </body>
 </html>
