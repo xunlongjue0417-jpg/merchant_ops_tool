@@ -191,6 +191,30 @@ def product_key(value):
     return re.sub(r"\s+", " ", text(value).lower()).strip()
 
 
+def variation_key(value):
+    """Stable natural ordering for numeric/word/color/size variations."""
+    words = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    sizes = {"2xs": 10, "xs": 20, "s": 30, "m": 40, "l": 50, "xl": 60, "2xl": 70, "3xl": 80, "4xl": 90, "5xl": 100}
+    colors = {"cream": 10, "white": 20, "black": 30, "red": 40, "blue": 50, "green": 60, "yellow": 70, "pink": 80, "purple": 90, "brown": 100, "grey": 110, "gray": 110}
+    result = []
+    for token in re.split(r"[,/|_-]+", text(value).lower()):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            result.append((0, int(token)))
+        elif token in words:
+            result.append((0, words[token]))
+        elif token in colors:
+            result.append((1, colors[token]))
+        elif token in sizes:
+            result.append((2, sizes[token]))
+        else:
+            result.append((3, token))
+    ordered = [item for rank in range(4) for item in result if item[0] == rank]
+    return tuple(ordered)
+
+
 def display_product_name(value, app_state):
     """Local presentation rules only; never alter the TikTok source or cost key."""
     result = text(value)
@@ -359,7 +383,7 @@ def parse_cost_table(path):
 
 
 def table(path, sheet, required_header):
-    rows = read_xlsx_rows(path, sheet)
+    rows = read_tabular_rows(path, sheet) if Path(path).suffix.lower() in (".csv", ".tsv") else read_xlsx_rows(path, sheet)
     header_index = next((i for i, row in enumerate(rows) if required_header in row), None)
     if header_index is None:
         raise ValueError(f"找不到栏位：{required_header}。请确认上传的是正确的 TikTok 导出表。")
@@ -472,7 +496,7 @@ SYSTEM_COLUMNS = {"商品名称", "Variation", "实际数量", "成本", "纯利
 
 def income_table(path):
     """Load a TikTok export, removing columns from an older tool export."""
-    rows = read_xlsx_rows(path, "Order details")
+    rows = read_tabular_rows(path, "Order details") if Path(path).suffix.lower() in (".csv", ".tsv") else read_xlsx_rows(path, "Order details")
     header_index = next((i for i, row in enumerate(rows) if "Order/Adjustment ID" in row), None)
     if header_index is None:
         raise ValueError("找不到栏位：Order/Adjustment ID。请确认上传的是正确的 TikTok 导出表。")
@@ -628,7 +652,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             by_order[key].append(row)
 
     app_state.setdefault("product_costs", {})
-    report, missing = [], {}
+    report, missing, catalog = [], {}, {}
     for order_id, settlement in settlements.items():
         order_lines = by_order.get(order_id, [])
         logistics_only = settlement["types"] and all(text(kind).lower() == "logistics reimbursement" for kind in settlement["types"])
@@ -684,6 +708,11 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                 flags.append("缺订单日期，无法选择历史成本")
             cost = choose_cost(app_state["costs"].get(sku_id, []), order_date, report_currency)
             cost = cost or choose_cost(app_state["product_costs"].get(product_key(name), []), order_date, report_currency)
+            catalog_key = "|".join((sku_id, product_key(name), product_key(line.get("Variation"))))
+            catalog_item = catalog.setdefault(catalog_key, {"sku_id": sku_id, "product_name": name, "variation": text(line.get("Variation")), "quantity": 0, "amount": ""})
+            catalog_item["quantity"] += quantity
+            if cost is not None:
+                catalog_item["amount"] = round(money(cost.get("amount")), 2)
             if quantity and cost is None:
                 missing[sku_id] = {
                     "sku_id": sku_id,
@@ -740,6 +769,15 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             "transaction_types": ", ".join(sorted(settlement["types"])),
             "editable": not lifecycle["cancelled"], **presentation,
         })
+    # Include products that appear only in the uploaded All Orders file
+    # (for example cancelled orders with no settlement row).
+    for line in orders:
+        name, sku_id, variation = text(line.get("Product Name")), normalized_id(line.get("SKU ID")), text(line.get("Variation"))
+        if not name and not sku_id:
+            continue
+        catalog_key = "|".join((sku_id, product_key(name), product_key(variation)))
+        item = catalog.setdefault(catalog_key, {"sku_id": sku_id, "product_name": name, "variation": variation, "quantity": 0, "amount": ""})
+        item["quantity"] += max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
     report.sort(key=lambda row: (row["status"] != "需核对", row["order_id"]), reverse=True)
     confirmed = [row for row in report if row["profit"] is not None]
     return {
@@ -753,6 +791,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         },
         "orders": report,
         "source_columns": source_columns,
+        "cost_catalog": sorted(catalog.values(), key=lambda item: (product_key(item["product_name"]), variation_key(item["variation"]))),
         "missing_costs": sorted(missing.values(), key=lambda item: item["product_name"]),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1142,7 +1181,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/download/cost-template":
             path = ROOT / "cost_table_template.csv"
-            raw = path.read_bytes()
+            raw = path.read_bytes() if path.is_file() else (
+                "Platform,SKU,Product Name,Variation,Unit Cost,Currency,Effective Date,Note\n"
+                "TikTok,,,,,MYR,2026/01/01,\n"
+            ).encode("utf-8-sig")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="cost_table_template.csv"')
