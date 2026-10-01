@@ -435,6 +435,34 @@ def rows_as_dicts(path, preferred_sheet="Order details"):
     return output, headers
 
 
+def detect_platform(income_path, orders_path):
+    """Infer the report family from distinctive headers, without guessing silently."""
+    _, income_headers = rows_as_dicts(income_path, "Income")
+    _, order_headers = rows_as_dicts(orders_path, "Orders")
+    income = {product_key(header) for header in income_headers}
+    orders = {product_key(header) for header in order_headers}
+    if {product_key("Order/Adjustment ID"), product_key("Total settlement amount")} <= income:
+        return "tiktok"
+    signatures = {
+        "shopee": ({"order_sn", "order_id"}, {"order_item_id"}, {"net_income", "net_payout", "amount"}),
+        "lazada": ({"order_id"}, {"seller_sku", "product_name"}, {"amount", "net_amount", "payout_amount"}),
+        "ebay": ({"order_id"}, {"item_id", "title"}, {"amount", "net_amount"}),
+        "amazon": ({"order_id"}, {"asin", "product_name"}, {"amount", "net_amount"}),
+    }
+    candidates = []
+    for platform, (income_markers, order_markers, amount_markers) in signatures.items():
+        score = len(income & income_markers) + len(orders & order_markers) + len(income & amount_markers)
+        if score >= 2:
+            candidates.append((score, platform))
+    if len(candidates) == 1:
+        return candidates[0][1]
+    if candidates:
+        candidates.sort(reverse=True)
+        if len(candidates) == 1 or candidates[0][0] > candidates[1][0]:
+            return candidates[0][1]
+    raise ValueError("无法可靠识别上传文件的平台报表格式。请确认上传的是同一平台的结算表和订单明细表。")
+
+
 def alias_value(row, key):
     candidates = {product_key(name): name for name in row}
     for alias in FIELD_ALIASES.get(key, ()):
@@ -1230,9 +1258,9 @@ class Handler(BaseHTTPRequestHandler):
                 form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers["Content-Type"]})
                 if not form.getfirst("income") or not form.getfirst("orders"):
                     raise ValueError("请选择 Income 与 All Orders 两个 Excel 文件。")
-                platform = product_key(form.getfirst("platform") or "tiktok")
-                if platform not in ("tiktok", "shopee", "ebay", "lazada", "amazon"):
-                    raise ValueError("不支持这个平台。请选择 TikTok、Shopee、eBay、Lazada 或 Amazon。")
+                requested_platform = product_key(form.getfirst("platform") or "auto")
+                if requested_platform not in ("auto", "tiktok", "shopee", "ebay", "lazada", "amazon"):
+                    raise ValueError("不支持这个平台。")
                 with tempfile.TemporaryDirectory() as directory:
                     paths = {}
                     for name in ("income", "orders"):
@@ -1247,11 +1275,16 @@ class Handler(BaseHTTPRequestHandler):
                         with path.open("wb") as output:
                             shutil.copyfileobj(field.file, output)
                         paths[name] = path
-                        DATA.mkdir(exist_ok=True)
+                    detected_platform = detect_platform(paths["income"], paths["orders"])
+                    if requested_platform != "auto" and requested_platform != detected_platform:
+                        raise ValueError(f"文件检测为 {detected_platform} 报表，与选择的平台不一致。")
+                    platform = detected_platform
+                    DATA.mkdir(exist_ok=True)
+                    for name, path in paths.items():
                         for old in DATA.glob(f"latest_{name}.*"):
                             if old.suffix.lower() in (".xlsx", ".csv", ".tsv"):
                                 old.unlink()
-                        shutil.copyfile(path, DATA / f"latest_{name}{suffix}")
+                        shutil.copyfile(path, DATA / f"latest_{name}{path.suffix.lower()}")
                     report_id = hashlib.sha256(paths["income"].read_bytes() + paths["orders"].read_bytes()).hexdigest()
                     current = state()
                     current["active_report_id"] = report_id
@@ -1359,8 +1392,31 @@ class Handler(BaseHTTPRequestHandler):
                 if not name or not re.fullmatch(r"[A-Za-z]{3}", currency):
                     raise ValueError("请提供商品名称与非负成本。")
                 current = state()
+                effective_from = text(payload.get("effective_from")) or "1900/01/01"
                 entries = current.setdefault("product_costs", {}).setdefault(product_key(name), [])
-                save_cost_entry(entries, amount, text(payload.get("effective_from")) or "1900/01/01", "商品名默认成本", currency)
+                save_cost_entry(entries, amount, effective_from, "商品名默认成本", currency)
+                # Product-level cost is the “apply to all variations” default.
+                # Remove stale SKU entries for this product/date/currency so
+                # they cannot mask the new value in the special-cost fields.
+                _, orders_path = latest_report_paths()
+                if orders_path.exists():
+                    try:
+                        order_lines = table(orders_path, "OrderSKUList", "Order ID")
+                    except Exception:
+                        order_lines = []
+                    matching_skus = {
+                        normalized_id(line.get("SKU ID"))
+                        for line in order_lines
+                        if normalized_id(line.get("SKU ID")) and (
+                            product_key(line.get("Product Name")) == product_key(name)
+                            or product_key(display_product_name(line.get("Product Name"), current)) == product_key(name)
+                        )
+                    }
+                    for sku_id in matching_skus:
+                        current["costs"][sku_id] = [
+                            entry for entry in current.get("costs", {}).get(sku_id, [])
+                            if not (text(entry.get("effective_from")) == effective_from and cost_currency(entry).upper() == currency.upper())
+                        ]
                 save_state(current)
                 self.json({"ok": True, "result": refresh_current_report(current)})
                 return
