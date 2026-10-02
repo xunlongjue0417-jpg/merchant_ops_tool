@@ -3,3 +3,4 @@
 .order-table-wrap td.product-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;vertical-align:top}
 .order-table-wrap th.operation-cell,.order-table-wrap td.operation-cell{position:sticky;right:0;z-index:2;background:#fff;box-shadow:-5px 0 8px #0f172a12;min-width:85px;width:85px}.order-table-wrap th.operation-cell{top:0;z-index:4;background:#f8fafc}.order-table-wrap tr{position:relative}.order-table-wrap tr.row-expanded td.product-cell{white-space:normal;overflow:hidden;text-overflow:clip}.order-table-wrap tbody tr:hover td{background:#f8fbff}
 .order-table-wrap tbody tr{cursor:default}.order-table-wrap tbody tr:hover{border-bottom:2px solid #818cf8}.row-resizing,.row-resizing *{cursor:row-resize!important;user-select:none!important}
+.order-table-wrap .operation-cell .save-order{padding:6px 11px;line-height:1.2}
