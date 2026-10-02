@@ -519,7 +519,7 @@ def normalized_platform_reports(platform, income_path, orders_path):
     return normalized_income, normalized_orders, income_headers, order_headers
 
 
-SYSTEM_COLUMNS = {"商品名称", "Variation", "实际数量", "成本", "纯利润", "核对状态"}
+SYSTEM_COLUMNS = {"商品名称", "Variation", "实际数量", "成本", "商品成本", "其他", "总成本", "纯利润", "核对状态"}
 
 
 def income_table(path):
@@ -701,7 +701,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         if logistics_only:
             report.append({
                 "order_id": order_id, "net_settlement": round(settlement["net"], 2), "actual_units": 0,
-                "details_units": 0, "cost": 0.0, "profit": round(settlement["net"], 2),
+                "details_units": 0, "cost": 0.0, "other_cost": 0.0, "other_cost_set": False, "total_cost": 0.0, "profit": round(settlement["net"], 2),
                 "status": "物流补偿，已计入", "status_code": "logistics_reimbursement",
                 "flags": "物流补偿不扣商品成本", "transaction_types": ", ".join(sorted(settlement["types"])),
                 "editable": True, **presentation,
@@ -712,10 +712,12 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         override = manual_override(app_state, order_id)
         net_settlement = money(override["net_settlement"]) if "net_settlement" in override else settlement["net"]
         override_cost = money(override["cost"]) if "cost" in override else None
+        other_cost = money(override.get("other_cost", 0))
+        other_cost_set = "other_cost" in override
         if lifecycle["cancelled"]:
             report.append({
                 "order_id": order_id, "net_settlement": round(net_settlement, 2), "actual_units": 0,
-                "details_units": settlement["details_units"], "cost": 0.0, "profit": None,
+                "details_units": settlement["details_units"], "cost": 0.0, "other_cost": 0.0, "other_cost_set": False, "total_cost": 0.0, "profit": None,
                 "status": "已取消", "status_code": "cancelled", "flags": "未结算，不计成本或利润", "transaction_types": ", ".join(sorted(settlement["types"])),
                 "editable": False, **presentation,
             })
@@ -764,18 +766,18 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             flags.append(f"数量不一致：订单 {actual_units} 件，结算详情 {settlement['details_units']} 件")
         if override_cost is not None:
             cost_total = override_cost
-            flags = [flag for flag in flags if not flag.startswith("找不到订单商品明细")]
-            if not order_lines:
-                # The merchant explicitly supplied the total historical cost,
-                # so a missing old All Orders row must not block the loss result.
-                flags = []
+            # A merchant-entered product cost is the final confirmation for a
+            # special order (for example a gift bundle). Do not keep it in
+            # Needs review merely because automatic line matching is absent.
+            flags = []
         refund_only = lifecycle["returned"] and not any(text(kind).lower().startswith("order") for kind in settlement["types"])
         if refund_only and override_cost is None:
             # The original sale was settled in an earlier report. Its COGS was
             # already recognised then; this report must not deduct it again.
             cost_total = 0.0
             flags = [flag for flag in flags if not flag.startswith("缺成本")]
-        profit_value = round(net_settlement - cost_total, 2) if not flags else None
+        total_cost = round(cost_total + other_cost, 2)
+        profit_value = round(net_settlement - total_cost, 2) if not flags else None
         if lifecycle["returned"]:
             refund_label = "已退货退款" if actual_units == 0 else f"部分退货退款（净售 {actual_units} 件）"
         elif is_refund_transaction(settlement["types"]):
@@ -790,6 +792,9 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             "actual_units": actual_units,
             "details_units": settlement["details_units"],
             "cost": round(cost_total, 2),
+            "other_cost": round(other_cost, 2),
+            "other_cost_set": other_cost_set,
+            "total_cost": total_cost,
             "profit": profit_value,
             "status": status,
             "status_code": status_code,
@@ -803,7 +808,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         "summary": {
             "settlement_total": round(sum(row["net_settlement"] for row in report), 2),
             "confirmed_profit": round(sum(row["profit"] for row in confirmed), 2),
-            "confirmed_cost": round(sum(row["cost"] for row in confirmed), 2),
+            "confirmed_cost": round(sum(row.get("total_cost", row["cost"]) for row in confirmed), 2),
             "orders": len(report),
             "needs_review": sum(row["status"] == "需核对" for row in report),
             "currency": report_currency,
@@ -819,7 +824,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
 def write_csv(report):
     REPORTS.mkdir(exist_ok=True)
     path = REPORTS / "latest_profit_report.csv"
-    columns = ["商品名称", "Variation", "订单", "币种", "到账", "订单件数", "结算件数", "总成本", "纯利润", "状态", "核对说明"] + report.get("source_columns", [])
+    columns = ["商品名称", "Variation", "订单", "币种", "到账", "订单件数", "结算件数", "商品成本", "其他", "总成本", "纯利润", "状态", "核对说明"] + report.get("source_columns", [])
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=columns)
         writer.writeheader()
@@ -827,7 +832,7 @@ def write_csv(report):
             row = {
                 "商品名称": item.get("product_name", ""), "Variation": item.get("variation", ""),
                 "订单": item["order_id"], "币种": report.get("summary", {}).get("currency", ""), "到账": item["net_settlement"], "订单件数": item["actual_units"],
-                "结算件数": item["details_units"], "总成本": item["cost"],
+                "结算件数": item["details_units"], "商品成本": item["cost"], "其他": item.get("other_cost", 0), "总成本": item.get("total_cost", item["cost"]),
                 "纯利润": "" if item["profit"] is None else item["profit"],
                 "状态": item["status"], "核对说明": item["flags"],
             }
@@ -842,7 +847,7 @@ def write_generic_augmented_xlsx(income_path, orders_path, app_state, platform):
     income, orders, income_headers, _ = normalized_platform_reports(product_key(platform), income_path, orders_path)
     result = analyse(income_path, orders_path, app_state, platform)
     by_order = {item["order_id"]: item for item in result["orders"]}
-    headers = [header for header in income_headers if header] + ["商品名称", "Variation", "SKU", "实际数量", "成本", "纯利润", "核对状态"]
+    headers = [header for header in income_headers if header] + ["商品名称", "Variation", "SKU", "实际数量", "商品成本", "其他", "总成本", "纯利润", "核对状态"]
     output = REPORTS / f"{platform.title()}_Income_with_Profit.xlsx"
     workbook = xlsxwriter.Workbook(output)
     sheet = workbook.add_worksheet("Income with Profit")
@@ -862,9 +867,9 @@ def write_generic_augmented_xlsx(income_path, orders_path, app_state, platform):
         variations = "\n".join(dict.fromkeys(text(line.get("Variation")) for line in lines if text(line.get("Variation"))))
         skus = "\n".join(dict.fromkeys(text(line.get("SKU ID")) for line in lines if text(line.get("SKU ID"))))
         values = [source.get(header, source.get("_raw", {}).get(header, "")) for header in income_headers]
-        values += [names, variations, skus, item.get("actual_units", ""), item.get("cost", ""), item.get("profit", ""), item.get("status", "")]
+        values += [names, variations, skus, item.get("actual_units", ""), item.get("cost", ""), item.get("other_cost", 0), item.get("total_cost", item.get("cost", "")), item.get("profit", ""), item.get("status", "")]
         for col, value in enumerate(values):
-            if headers[col] in ("成本", "纯利润") and value not in ("", None):
+            if headers[col] in ("商品成本", "其他", "总成本", "纯利润") and value not in ("", None):
                 sheet.write_number(index, col, float(value), number_format)
             else:
                 sheet.write(index, col, value, cell_format)
@@ -884,7 +889,7 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
     # TikTok changes report columns between exports/regions. When the
     # optional Total Revenue column is absent, append calculated columns.
     insert_at = original_headers.index("Total Revenue") + 1 if "Total Revenue" in original_headers else len(original_headers)
-    added = ["商品名称", "Variation", "实际数量", "成本", "纯利润", "核对状态"]
+    added = ["商品名称", "Variation", "实际数量", "商品成本", "其他", "总成本", "纯利润", "核对状态"]
     headers = original_headers[:insert_at] + added + original_headers[insert_at:]
     by_order = defaultdict(list)
     for line in orders:
@@ -900,24 +905,28 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
         order_id = normalized_id(source.get("Related order ID") or source.get("Order/Adjustment ID"))
         transaction = text(source.get("Transaction type")).lower()
         names, variations, quantity, cost_total, flags = [], [], 0, 0.0, []
+        total_cost = ""
         lifecycle = order_lifecycle(by_order.get(order_id, []))
         override = manual_override(app_state, order_id)
         net_settlement = money(override["net_settlement"]) if "net_settlement" in override else totals[order_id]["net"]
+        other = money(override.get("other_cost", 0))
         if transaction == "logistics reimbursement":
             status = "物流补偿，已计入"
             cost = 0.0
-            profit = round(net_settlement, 2)
+            total_cost = other
+            profit = round(net_settlement - total_cost, 2)
         elif order_id in seen:
             status = "同订单调整行；成本已在首次订单行计算"
-            cost = profit = ""
+            cost = other = total_cost = profit = ""
         elif lifecycle["cancelled"]:
             seen.add(order_id)
             status = "已取消"
-            cost = profit = ""
+            cost = other = total_cost = profit = ""
         elif not by_order.get(order_id):
             seen.add(order_id)
             cost = money(override["cost"]) if "cost" in override else ""
-            profit = round(net_settlement - cost, 2) if isinstance(cost, float) else ""
+            total_cost = round(cost + other, 2) if isinstance(cost, float) else ""
+            profit = round(net_settlement - total_cost, 2) if isinstance(total_cost, float) else ""
             status = "退款/订单缺商品明细；请在网页手动填总成本" if cost == "" else "手动成本已用于计算"
         else:
             seen.add(order_id)
@@ -940,6 +949,7 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
             if "cost" in override:
                 cost_total = money(override["cost"])
                 missing = False
+                flags = []
             if missing:
                 flags.append("缺成本")
             details = totals[order_id]["details"]
@@ -950,7 +960,8 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
                 cost_total = 0.0
                 flags = [flag for flag in flags if flag != "缺成本"]
             cost = "" if missing else round(cost_total, 2)
-            profit_value = None if flags else round(net_settlement - cost_total, 2)
+            total_cost = round(cost_total + other, 2)
+            profit_value = None if flags else round(net_settlement - total_cost, 2)
             profit = "" if profit_value is None else profit_value
             if flags:
                 status = "；".join(flags)
@@ -966,7 +977,9 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
         ]
         if "net_settlement" in override and profit != "" and status != "已取消":
             status = f"{status}；手动到账已用于利润"
-        extra = ["\n".join(names), "\n".join(variations), quantity if names else "", cost, profit, status]
+        if total_cost == "":
+            total_cost = "" if cost == "" else round(money(cost) + money(other), 2)
+        extra = ["\n".join(names), "\n".join(variations), quantity if names else "", cost, other, total_cost, profit, status]
         rows.append(base[:insert_at] + extra + base[insert_at:])
         if "net_settlement" in override and profit != "":
             profit_net_overrides[str(len(rows) - 1)] = net_settlement
@@ -995,7 +1008,7 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
     start = headers.index("商品名称")
     for index, header in enumerate(headers):
         worksheet.write(0, index, header, detail_header_format if start <= index < start + 6 else header_format)
-    numeric_headers = {"Total settlement amount", "Total Revenue", "成本", "纯利润"}
+    numeric_headers = {"Total settlement amount", "Total Revenue", "商品成本", "其他", "总成本", "纯利润"}
     for row_index, row in enumerate(rows, start=1):
         for column_index, value in enumerate(row):
             header = headers[column_index]
@@ -1019,7 +1032,9 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
 
     order_index = headers.index("Order/Adjustment ID")
     settlement_index = headers.index("Total settlement amount")
-    cost_index = headers.index("成本")
+    cost_index = headers.index("商品成本")
+    other_index = headers.index("其他")
+    total_cost_index = headers.index("总成本")
     profit_index = headers.index("纯利润")
     status_index = headers.index("核对状态")
     for row_index, row in enumerate(rows, start=1):
@@ -1033,7 +1048,8 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
             net_expression = str(float(override_net))
         else:
             net_expression = f'SUMIF(${excel_column(order_index)}$2:${excel_column(order_index)}${len(rows) + 1},{excel_column(order_index)}{excel_row},${excel_column(settlement_index)}$2:${excel_column(settlement_index)}${len(rows) + 1})'
-        worksheet.write_formula(row_index, profit_index, f"={net_expression}-{excel_column(cost_index)}{excel_row}", number_format)
+        worksheet.write_formula(row_index, total_cost_index, f"={excel_column(cost_index)}{excel_row}+{excel_column(other_index)}{excel_row}", number_format)
+        worksheet.write_formula(row_index, profit_index, f"={net_expression}-{excel_column(total_cost_index)}{excel_row}", number_format)
 
     summary_row = len(rows) + 2
     worksheet.write(summary_row, order_index, "总计", total_label_format)
@@ -1351,12 +1367,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请先分析当前两份 Excel，再修改订单。")
                 current["override_report_id"] = current["active_report_id"]
                 override = current.setdefault("order_overrides", {}).setdefault(order_id, {})
-                for field in ("net_settlement", "cost"):
+                for field in ("net_settlement", "cost", "other_cost"):
                     if field in payload:
                         value = text(payload[field])
                         if value == "":
                             override.pop(field, None)
-                        elif field == "cost":
+                        elif field in ("cost", "other_cost"):
                             override[field] = strict_money(value)
                         else:
                             override[field] = strict_signed_money(value)
@@ -1411,10 +1427,10 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     }
                     for sku_id in matching_skus:
-                        current["costs"][sku_id] = [
-                            entry for entry in current.get("costs", {}).get(sku_id, [])
-                            if not (text(entry.get("effective_from")) == effective_from and cost_currency(entry).upper() == currency.upper())
-                        ]
+                        # Applying a product cost intentionally resets every
+                        # existing per-SKU override for that product. A later
+                        # “special cost” save can create a new exception.
+                        current["costs"][sku_id] = []
                 save_state(current)
                 self.json({"ok": True, "result": refresh_current_report(current)})
                 return
