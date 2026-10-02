@@ -842,7 +842,9 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             "quantity_source": quantity_source,
             "editable": not lifecycle["cancelled"], **presentation,
         })
-    report.sort(key=lambda row: (row["status"] != "需核对", row["order_id"]), reverse=True)
+    # `settlements` is populated in Income file order and dicts preserve that
+    # order. Keep the report in that same order; the browser can still apply
+    # an explicit sort when the user clicks a column header.
     confirmed = [row for row in report if row["profit"] is not None]
     return {
         "summary": {
