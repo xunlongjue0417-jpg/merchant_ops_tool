@@ -797,15 +797,6 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             "transaction_types": ", ".join(sorted(settlement["types"])),
             "editable": not lifecycle["cancelled"], **presentation,
         })
-    # Include products that appear only in the uploaded All Orders file
-    # (for example cancelled orders with no settlement row).
-    for line in orders:
-        name, sku_id, variation = text(line.get("Product Name")), normalized_id(line.get("SKU ID")), text(line.get("Variation"))
-        if not name and not sku_id:
-            continue
-        catalog_key = "|".join((sku_id, product_key(name), product_key(variation)))
-        item = catalog.setdefault(catalog_key, {"sku_id": sku_id, "product_name": name, "variation": variation, "quantity": 0, "amount": ""})
-        item["quantity"] += max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
     report.sort(key=lambda row: (row["status"] != "需核对", row["order_id"]), reverse=True)
     confirmed = [row for row in report if row["profit"] is not None]
     return {
@@ -1085,18 +1076,21 @@ def latest_report_paths():
 def cost_catalog(app_state):
     """All products in the latest All Orders file, including already-priced ones."""
     income_path, path = latest_report_paths()
-    if not path.exists():
+    if not path.exists() or not income_path.exists():
         return []
     active_platform = product_key(app_state.get("active_platform", "tiktok"))
     if active_platform not in ("", "tiktok", "tiktok shop"):
         try:
-            _, generic_orders, _, _ = normalized_platform_reports(active_platform, income_path, path)
+            generic_income, generic_orders, _, _ = normalized_platform_reports(active_platform, income_path, path)
         except Exception:
             return []
+        income_ids = {normalized_id(row.get("Order ID") or row.get("Related order ID")) for row in generic_income}
         lines = generic_orders
         grouped = {}
         platform_costs = app_state.get("platform_costs", {}).get(active_platform, {})
         for line in lines:
+            if normalized_id(line.get("Order ID")) not in income_ids:
+                continue
             name = text(line.get("Product Name"))
             sku_id = normalized_id(line.get("SKU ID"))
             if not name and not sku_id:
@@ -1113,8 +1107,12 @@ def cost_catalog(app_state):
                 "default_amount": "", "sku_amount": "" if variant is None else money(variant.get("amount")),
             })
         return [row for group in grouped.values() for row in group["rows"]]
+    income_rows, _ = rows_as_dicts(income_path, "Income")
+    income_ids = {normalized_id(row.get("Related order ID") or row.get("Order/Adjustment ID")) for row in income_rows}
     grouped = {}
     for line in table(path, "OrderSKUList", "Order ID"):
+        if normalized_id(line.get("Order ID")) not in income_ids:
+            continue
         name = text(line.get("Product Name"))
         if not name:
             continue
