@@ -5,3 +5,4 @@
 .order-table-wrap tbody tr{cursor:default}.order-table-wrap tbody tr:hover{border-bottom:2px solid #818cf8}.row-resizing,.row-resizing *{cursor:row-resize!important;user-select:none!important}
 .order-table-wrap .operation-cell .save-order{padding:6px 11px;line-height:1.2}
 .order-table-wrap thead{position:sticky!important;top:0;z-index:10;background:#f8fafc}.order-table-wrap th.operation-cell{position:sticky!important;right:0!important;top:0!important;display:table-cell!important;visibility:visible!important;white-space:nowrap!important;overflow:visible!important;color:#334155!important}.order-table-wrap td.operation-cell{position:sticky!important;right:0!important;visibility:visible!important;z-index:3}.operation-label{display:inline-block;visibility:visible!important;color:#334155!important}
+.order-table-wrap tbody tr.row-expanded td.product-cell{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-word}
