@@ -444,15 +444,18 @@ def detect_platform(income_path, orders_path):
     if {product_key("Order/Adjustment ID"), product_key("Total settlement amount")} <= income:
         return "tiktok"
     signatures = {
-        "shopee": ({"order_sn", "order_id"}, {"order_item_id"}, {"net_income", "net_payout", "amount"}),
-        "lazada": ({"order_id"}, {"seller_sku", "product_name"}, {"amount", "net_amount", "payout_amount"}),
-        "ebay": ({"order_id"}, {"item_id", "title"}, {"amount", "net_amount"}),
-        "amazon": ({"order_id"}, {"asin", "product_name"}, {"amount", "net_amount"}),
+        "shopee": ({"order_sn", "order id", "order_id"}, {"order_item_id", "item_id", "sku"}, {"net_income", "net_payout", "amount", "net amount"}),
+        "lazada": ({"order_id"}, {"seller_sku", "product_name", "item_title"}, {"amount", "net_amount", "payout_amount"}),
+        "ebay": ({"order_id"}, {"item_id", "title", "item_title"}, {"amount", "net_amount", "payout_amount"}),
+        "amazon": ({"order_id", "amazon order id"}, {"asin", "product_name", "sku"}, {"amount", "net_amount", "payout_amount"}),
     }
     candidates = []
     for platform, (income_markers, order_markers, amount_markers) in signatures.items():
-        score = len(income & income_markers) + len(orders & order_markers) + len(income & amount_markers)
-        if score >= 2:
+        income_order = bool(income & income_markers)
+        order_item = bool(orders & order_markers)
+        settlement_amount = bool(income & amount_markers)
+        score = int(income_order) + int(order_item) + int(settlement_amount)
+        if score == 3:
             candidates.append((score, platform))
     if len(candidates) == 1:
         return candidates[0][1]
@@ -575,6 +578,25 @@ def detail_quantity(value):
     return number(raw) if re.fullmatch(r"\d+(?:\.0+)?", raw) else 0
 
 
+def detail_item_quantities(value):
+    """Parse marketplace settlement item details as SKU -> quantity.
+
+    TikTok's Income export uses values such as ``SKU_ID * 2;``.  Other
+    marketplaces may use ``x`` or ``×``.  We only accept an identifier before
+    the multiplier so explanatory text cannot silently become a SKU.
+    """
+    result = defaultdict(int)
+    for raw_sku, raw_quantity in re.findall(
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\*|x|×)\s*(\d+(?:\.0+)?)",
+        text(value),
+        flags=re.IGNORECASE,
+    ):
+        sku = normalized_id(raw_sku)
+        if sku and sku.lower() not in {"item", "items", "sku", "product"}:
+            result[sku] += int(float(raw_quantity))
+    return dict(result)
+
+
 def date_key(value):
     raw = text(value)
     if re.fullmatch(r"\d+(?:\.0+)?", raw):
@@ -658,6 +680,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
 
     source_columns = [key for key in (list(income[0].keys()) if income else []) if not key.startswith("_")]
     settlements = defaultdict(lambda: {"net": 0.0, "details_units": 0, "types": set(), "rows": 0, "source": defaultdict(list)})
+    income_items = defaultdict(lambda: defaultdict(int))
     for row in income:
         transaction_type = text(row.get("Transaction type"))
         key = normalized_id(row.get("Related order ID") or row.get("Order/Adjustment ID"))
@@ -668,6 +691,8 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         bucket["details_units"] += detail_quantity(row.get("Details of items sold"))
         bucket["types"].add(transaction_type or "Unknown")
         bucket["rows"] += 1
+        for sku_id, quantity in detail_item_quantities(row.get("Details of items sold" )).items():
+            income_items[key][sku_id] += quantity
         for field in source_columns:
             value = text(row.get(field))
             if value and value not in bucket["source"][field]:
@@ -680,6 +705,8 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             by_order[key].append(row)
 
     app_state.setdefault("product_costs", {})
+    platform_name = product_key(platform)
+    sku_costs = app_state.get("costs", {}) if platform_name in ("", "tiktok", "tiktok shop") else app_state.get("platform_costs", {}).get(platform_name, {})
     report, missing, catalog = [], {}, {}
     for order_id, settlement in settlements.items():
         order_lines = by_order.get(order_id, [])
@@ -704,11 +731,16 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                 "details_units": 0, "cost": 0.0, "other_cost": 0.0, "other_cost_set": False, "total_cost": 0.0, "profit": round(settlement["net"], 2),
                 "status": "物流补偿，已计入", "status_code": "logistics_reimbursement",
                 "flags": "物流补偿不扣商品成本", "transaction_types": ", ".join(sorted(settlement["types"])),
-                "editable": True, **presentation,
+                "quantity_source": "Income", "editable": True, **presentation,
             })
             continue
         flags = []
         lifecycle = order_lifecycle(order_lines)
+        income_skus = income_items.get(order_id, {})
+        income_sku_match = bool(income_skus) and any(normalized_id(line.get("SKU ID")) in income_skus for line in order_lines)
+        quantity_source = "Income" if income_sku_match else ("All Orders辅助（Income无SKU明细）" if order_lines else "Income")
+        if income_skus and order_lines and not income_sku_match:
+            flags.append("Income 商品明细无法匹配订单规格")
         override = manual_override(app_state, order_id)
         net_settlement = money(override["net_settlement"]) if "net_settlement" in override else settlement["net"]
         override_cost = money(override["cost"]) if "cost" in override else None
@@ -719,7 +751,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                 "order_id": order_id, "net_settlement": round(net_settlement, 2), "actual_units": 0,
                 "details_units": settlement["details_units"], "cost": 0.0, "other_cost": 0.0, "other_cost_set": False, "total_cost": 0.0, "profit": None,
                 "status": "已取消", "status_code": "cancelled", "flags": "未结算，不计成本或利润", "transaction_types": ", ".join(sorted(settlement["types"])),
-                "editable": False, **presentation,
+                "quantity_source": quantity_source, "editable": False, **presentation,
             })
             continue
         if not order_lines and override_cost is None:
@@ -729,15 +761,22 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         for line in order_lines:
             sku_id = normalized_id(line.get("SKU ID"))
             name = text(line.get("Product Name"))
-            quantity = max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
+            sku_id = normalized_id(line.get("SKU ID"))
+            if income_sku_match:
+                # Income is authoritative for sold quantity. All Orders only
+                # contributes return/cancellation lifecycle information.
+                quantity = max(0, income_skus.get(sku_id, 0) - number(line.get("Sku Quantity of return")))
+            else:
+                quantity = max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
             actual_units += quantity
             # Income exports name this field "Order created time"; All Orders
             # exports call the same business date "Created Time".
             order_date = text(line.get("Order created time") or line.get("Created Time"))
             if not date_key(order_date):
                 flags.append("缺订单日期，无法选择历史成本")
-            cost = choose_cost(app_state["costs"].get(sku_id, []), order_date, report_currency)
-            cost = cost or choose_cost(app_state["product_costs"].get(product_key(name), []), order_date, report_currency)
+            cost = choose_cost(sku_costs.get(sku_id, []), order_date, report_currency)
+            product_cost_entries = app_state["product_costs"].get(product_key(name), []) if platform_name in ("", "tiktok", "tiktok shop") else sku_costs.get(product_key(name), [])
+            cost = cost or choose_cost(product_cost_entries, order_date, report_currency)
             catalog_key = "|".join((sku_id, product_key(name), product_key(line.get("Variation"))))
             catalog_item = catalog.setdefault(catalog_key, {"sku_id": sku_id, "product_name": name, "variation": text(line.get("Variation")), "quantity": 0, "amount": ""})
             catalog_item["quantity"] += quantity
@@ -751,7 +790,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                     "quantity": 0,
                 }
                 missing[sku_id]["quantity"] += quantity
-                available = app_state["costs"].get(sku_id, []) or app_state["product_costs"].get(product_key(name), [])
+                available = sku_costs.get(sku_id, []) or product_cost_entries
                 if available and not any(cost_currency(entry).upper() == report_currency.upper() for entry in available):
                     flags.append(f"成本币种不匹配：{sku_id}")
                 elif not date_key(order_date):
@@ -800,6 +839,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             "status_code": status_code,
             "flags": "；".join(dict.fromkeys(flags)),
             "transaction_types": ", ".join(sorted(settlement["types"])),
+            "quantity_source": quantity_source,
             "editable": not lifecycle["cancelled"], **presentation,
         })
     report.sort(key=lambda row: (row["status"] != "需核对", row["order_id"]), reverse=True)
@@ -824,7 +864,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
 def write_csv(report):
     REPORTS.mkdir(exist_ok=True)
     path = REPORTS / "latest_profit_report.csv"
-    columns = ["商品名称", "Variation", "订单", "币种", "到账", "订单件数", "结算件数", "商品成本", "其他", "总成本", "纯利润", "状态", "核对说明"] + report.get("source_columns", [])
+    columns = ["商品名称", "Variation", "订单", "币种", "到账", "订单件数", "结算件数", "数量来源", "商品成本", "其他", "总成本", "纯利润", "状态", "核对说明"] + report.get("source_columns", [])
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=columns)
         writer.writeheader()
@@ -832,7 +872,7 @@ def write_csv(report):
             row = {
                 "商品名称": item.get("product_name", ""), "Variation": item.get("variation", ""),
                 "订单": item["order_id"], "币种": report.get("summary", {}).get("currency", ""), "到账": item["net_settlement"], "订单件数": item["actual_units"],
-                "结算件数": item["details_units"], "商品成本": item["cost"], "其他": item.get("other_cost", 0), "总成本": item.get("total_cost", item["cost"]),
+                "结算件数": item["details_units"], "数量来源": item.get("quantity_source", ""), "商品成本": item["cost"], "其他": item.get("other_cost", 0), "总成本": item.get("total_cost", item["cost"]),
                 "纯利润": "" if item["profit"] is None else item["profit"],
                 "状态": item["status"], "核对说明": item["flags"],
             }
@@ -1329,13 +1369,14 @@ class Handler(BaseHTTPRequestHandler):
                     records, skipped = parse_cost_table(path)
                 current = state()
                 current.setdefault("platform_costs", {})
+                active_platform = product_key(current.get("active_platform", "tiktok"))
                 imported = applied = stored_for_later = conflicts = 0
                 for record in records:
                     imported += 1
                     platform = product_key(record["platform"])
-                    # TikTok is the currently active importer. Other platform
-                    # rows are retained separately so they cannot accidentally
-                    # change TikTok's result before their adapter is enabled.
+                    # Keep each platform isolated. Rows for the active platform
+                    # apply immediately; other rows are retained for a later
+                    # analysis instead of changing the current report.
                     target = current["costs"] if platform in ("", "tiktok", "tiktok shop") else current["platform_costs"].setdefault(platform, {})
                     key = record["sku"] or product_key(record["product_name"])
                     entries = target.setdefault(key, [])
@@ -1343,14 +1384,14 @@ class Handler(BaseHTTPRequestHandler):
                         conflicts += 1
                         continue
                     save_cost_entry(entries, record["amount"], record["effective_from"], record["note"], record["currency"])
-                    if platform in ("", "tiktok", "tiktok shop"):
-                        if record["sku"]:
-                            applied += 1
-                        else:
+                    if platform in ("", "tiktok", "tiktok shop") and active_platform in ("", "tiktok", "tiktok shop"):
+                        if not record["sku"]:
                             product_entries = current.setdefault("product_costs", {}).setdefault(product_key(record["product_name"]), [])
                             if not any(text(entry.get("effective_from")) == record["effective_from"] and cost_currency(entry).upper() == record["currency"].upper() for entry in product_entries):
                                 save_cost_entry(product_entries, record["amount"], record["effective_from"], record["note"], record["currency"])
-                            applied += 1
+                        applied += 1
+                    elif platform == active_platform:
+                        applied += 1
                     else:
                         stored_for_later += 1
                 save_state(current)
@@ -1382,8 +1423,9 @@ class Handler(BaseHTTPRequestHandler):
                 income_path, orders_path = latest_report_paths()
                 if not income_path.exists() or not orders_path.exists():
                     raise ValueError("请先重新分析两份 Excel。")
-                result = analyse(income_path, orders_path, current)
-                write_augmented_xlsx(income_path, orders_path, current)
+                platform = current.get("active_platform", "tiktok")
+                result = analyse(income_path, orders_path, current, platform)
+                write_augmented_xlsx(income_path, orders_path, current, platform)
                 write_csv(result)
                 self.json(result)
                 return
@@ -1394,7 +1436,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not sku_id or not re.fullmatch(r"[A-Za-z]{3}", currency):
                     raise ValueError("请提供 TikTok SKU ID 与非负成本。")
                 current = state()
-                entries = current["costs"].setdefault(sku_id, [])
+                active_platform = product_key(current.get("active_platform", "tiktok"))
+                cost_bucket = current["costs"] if active_platform in ("", "tiktok", "tiktok shop") else current.setdefault("platform_costs", {}).setdefault(active_platform, {})
+                entries = cost_bucket.setdefault(sku_id, [])
                 save_cost_entry(entries, amount, text(payload.get("effective_from")) or "1900/01/01", text(payload.get("note")), currency)
                 save_state(current)
                 self.json({"ok": True, "result": refresh_current_report(current)})
@@ -1407,7 +1451,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请提供商品名称与非负成本。")
                 current = state()
                 effective_from = text(payload.get("effective_from")) or "1900/01/01"
-                entries = current.setdefault("product_costs", {}).setdefault(product_key(name), [])
+                active_platform = product_key(current.get("active_platform", "tiktok"))
+                product_bucket = current.setdefault("product_costs", {}) if active_platform in ("", "tiktok", "tiktok shop") else current.setdefault("platform_costs", {}).setdefault(active_platform, {})
+                entries = product_bucket.setdefault(product_key(name), [])
                 save_cost_entry(entries, amount, effective_from, "商品名默认成本", currency)
                 # Product-level cost is the “apply to all variations” default.
                 # Remove stale SKU entries for this product/date/currency so
@@ -1430,7 +1476,10 @@ class Handler(BaseHTTPRequestHandler):
                         # Applying a product cost intentionally resets every
                         # existing per-SKU override for that product. A later
                         # “special cost” save can create a new exception.
-                        current["costs"][sku_id] = []
+                        if active_platform in ("", "tiktok", "tiktok shop"):
+                            current["costs"][sku_id] = []
+                        else:
+                            current.setdefault("platform_costs", {}).setdefault(active_platform, {})[sku_id] = []
                 save_state(current)
                 self.json({"ok": True, "result": refresh_current_report(current)})
                 return
@@ -1445,8 +1494,9 @@ class Handler(BaseHTTPRequestHandler):
                 save_state(current)
                 income_path, orders_path = latest_report_paths()
                 if income_path.exists() and orders_path.exists():
-                    result = analyse(income_path, orders_path, current)
-                    write_augmented_xlsx(income_path, orders_path, current)
+                    platform = current.get("active_platform", "tiktok")
+                    result = analyse(income_path, orders_path, current, platform)
+                    write_augmented_xlsx(income_path, orders_path, current, platform)
                     write_csv(result)
                     self.json({"ok": True, "rules": rules, "result": result})
                 else:
