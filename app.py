@@ -636,17 +636,23 @@ def date_key(value):
 
 def choose_cost(cost_entries, order_date, currency="MYR"):
     order_day = date_key(order_date)
-    if order_day is None:
-        return None
-    applicable = [
+    currency_entries = [
         entry for entry in cost_entries
         if cost_currency(entry).upper() == currency.upper()
         and date_key(entry.get("effective_from")) is not None
-        and date_key(entry.get("effective_from")) <= order_day
     ]
-    if not applicable:
+    if order_day is None:
         return None
-    return max(applicable, key=lambda entry: date_key(entry.get("effective_from")) or datetime.min.date())
+    applicable = [entry for entry in currency_entries if date_key(entry.get("effective_from")) <= order_day]
+    if applicable:
+        return max(applicable, key=lambda entry: date_key(entry.get("effective_from")) or datetime.min.date())
+    # Costs explicitly confirmed from the current report are immediate
+    # overrides, not historical cost-table entries.
+    immediate_notes = {"商品名默认成本", "selected", "variation override"}
+    immediate = [entry for entry in currency_entries if text(entry.get("note")) in immediate_notes]
+    if not immediate:
+        return None
+    return max(immediate, key=lambda entry: date_key(entry.get("effective_from")) or datetime.min.date())
 
 
 def joined_line_text(lines):
