@@ -232,6 +232,12 @@ def save_cost_entry(entries, amount, effective_from, note, currency="MYR"):
     entries.sort(key=lambda item: item["effective_from"])
 
 
+def report_filename(platform):
+    """Return one canonical download name for every supported platform."""
+    key = product_key(platform)
+    return "TikTok_Income_with_Profit.xlsx" if key in ("", "tiktok", "tiktok shop") else f"{key.title()}_Income_with_Profit.xlsx"
+
+
 def cost_currency(entry):
     return text(entry.get("currency")) or "MYR"
 
@@ -736,11 +742,10 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             continue
         flags = []
         lifecycle = order_lifecycle(order_lines)
-        income_skus = income_items.get(order_id, {})
-        income_sku_match = bool(income_skus) and any(normalized_id(line.get("SKU ID")) in income_skus for line in order_lines)
-        quantity_source = "Income" if income_sku_match else ("All Orders辅助（Income无SKU明细）" if order_lines else "Income")
-        if income_skus and order_lines and not income_sku_match:
-            flags.append("Income 商品明细无法匹配订单规格")
+        # All Orders is the line-level authority: it contains every variation
+        # and its quantity. Income remains authoritative for settlement money.
+        # Do not let a partial Income SKU list zero out a second variation.
+        quantity_source = "All Orders" if order_lines else "Income"
         override = manual_override(app_state, order_id)
         net_settlement = money(override["net_settlement"]) if "net_settlement" in override else settlement["net"]
         override_cost = money(override["cost"]) if "cost" in override else None
@@ -762,12 +767,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             sku_id = normalized_id(line.get("SKU ID"))
             name = text(line.get("Product Name"))
             sku_id = normalized_id(line.get("SKU ID"))
-            if income_sku_match:
-                # Income is authoritative for sold quantity. All Orders only
-                # contributes return/cancellation lifecycle information.
-                quantity = max(0, income_skus.get(sku_id, 0) - number(line.get("Sku Quantity of return")))
-            else:
-                quantity = max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
+            quantity = max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
             actual_units += quantity
             # Income exports name this field "Order created time"; All Orders
             # exports call the same business date "Created Time".
@@ -890,7 +890,7 @@ def write_generic_augmented_xlsx(income_path, orders_path, app_state, platform):
     result = analyse(income_path, orders_path, app_state, platform)
     by_order = {item["order_id"]: item for item in result["orders"]}
     headers = [header for header in income_headers if header] + ["商品名称", "Variation", "SKU", "实际数量", "商品成本", "其他", "总成本", "纯利润", "核对状态"]
-    output = REPORTS / f"{platform.title()}_Income_with_Profit.xlsx"
+    output = REPORTS / report_filename(platform)
     workbook = xlsxwriter.Workbook(output)
     sheet = workbook.add_worksheet("Income with Profit")
     header_format = workbook.add_format({"bg_color": "#4A37B8", "font_color": "#FFFFFF", "bold": True, "text_wrap": True, "border": 1})
@@ -1250,7 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/download/latest":
             current_platform = product_key(state().get("active_platform", "tiktok"))
-            filename = f"{current_platform.title()}_Income_with_Profit.xlsx"
+            filename = report_filename(current_platform)
             path = REPORTS / filename
             if not path.exists():
                 self.json({"error": "尚未生成报告"}, HTTPStatus.NOT_FOUND)
@@ -1285,7 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             current_platform = product_key(state().get("active_platform", "tiktok"))
-            self.send_header("Content-Disposition", f'attachment; filename="{current_platform.title()}_Income_with_Profit.csv"')
+            csv_filename = report_filename(current_platform).replace(".xlsx", ".csv")
+            self.send_header("Content-Disposition", f'attachment; filename="{csv_filename}"')
             self.send_header("Content-Length", len(raw))
             self.end_headers()
             self.wfile.write(raw)
