@@ -93,6 +93,7 @@ REPORTS = ROOT / "reports"
 STATIC = ROOT / "static"
 STATE_PATH = DATA / "state.json"
 STATE_LOCK = threading.Lock()
+REPORT_LOCK = threading.RLock()
 ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "")
 LOCAL_NODE = Path(r"C:\Users\Win10\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -271,6 +272,11 @@ def worksheet_path(archive, desired_name):
     return target if target.startswith("xl/") else f"xl/{target}"
 
 
+class WorksheetRows(list):
+    """Rows plus physical worksheet positions for source audit references."""
+    pass
+
+
 def read_xlsx_rows(path, preferred_sheet):
     """Read XLSX XML directly so malformed export dimensions cannot hide columns."""
     with zipfile.ZipFile(path) as archive:
@@ -296,7 +302,8 @@ def read_xlsx_rows(path, preferred_sheet):
             else:
                 value = ""
             cells[index] = value
-    rows = []
+    rows = WorksheetRows()
+    rows.source_row_numbers = []
     for row_number in sorted(grouped):
         cells = grouped[row_number]
         if not cells:
@@ -305,6 +312,7 @@ def read_xlsx_rows(path, preferred_sheet):
         for index, value in cells.items():
             result[index] = value
         rows.append(result)
+        rows.source_row_numbers.append(row_number)
     return rows
 
 
@@ -407,16 +415,16 @@ def table(path, sheet, required_header):
 
 
 FIELD_ALIASES = {
-    "order_id": ("Order ID", "OrderId", "OrderID", "order-id", "order_sn", "order number", "OrderNumber", "Order/Adjustment ID", "Related order ID"),
-    "order_item_id": ("Order line item ID", "OrderLineItemID", "Order Item ID", "order-item-id", "order_item_id"),
+    "order_id": ("Order ID", "OrderId", "OrderID", "order-id", "order_sn", "order number", "OrderNumber", "order_no", "order_id", "Order/Adjustment ID", "Related order ID"),
+    "order_item_id": ("Order line item ID", "OrderLineItemID", "Order Item ID", "order-item-id", "order_item_id", "orderItemId", "orderItem_no"),
     "product_id": ("Product ID", "ProductId", "product-id", "ItemID", "ASIN", "asin"),
-    "product_name": ("Product Name", "ProductName", "item_name", "product-name", "Item title", "Title", "item-name", "ProductName"),
-    "variation": ("Variation", "model_name", "Model", "variant", "variation_name", "Item variation"),
-    "sku": ("SKU ID", "SKU", "item_sku", "model_sku", "seller-sku", "SellerSKU", "seller_sku", "merchant-sku"),
+    "product_name": ("Product Name", "ProductName", "item_name", "product-name", "Item title", "Title", "item-name", "ProductName", "itemName", "Item Name", "details"),
+    "variation": ("Variation", "model_name", "Model", "variant", "variation_name", "Item variation", "Variation Name"),
+    "sku": ("SKU ID", "SKU", "model_sku", "item_sku", "seller-sku", "SellerSKU", "seller_sku", "merchant-sku", "SKU Reference No."),
     "quantity": ("Quantity", "quantity", "QuantityOrdered", "quantity-ordered", "Qty", "Units"),
-    "return_quantity": ("Sku Quantity of return", "return_quantity", "Return Quantity", "refund-quantity"),
-    "order_date": ("Order created time", "Created Time", "Order Creation Date", "order_date", "Sale date", "purchase-date", "CreatedAt", "created_at"),
-    "settlement": ("Total settlement amount", "Total Released Amount (RM)", "Total Released Amount", "netPayout", "Net Payout", "Net amount", "net_amount", "Amount", "amount", "total-amount", "payout_amount"),
+    "return_quantity": ("Sku Quantity of return", "return_quantity", "Return Quantity", "refund-quantity", "Returned quantity"),
+    "order_date": ("Order created time", "Created Time", "Order Creation Date", "order_date", "Sale date", "purchase-date", "CreatedAt", "created_at", "createTime"),
+    "settlement": ("Total settlement amount", "Total Released Amount (RM)", "Total Released Amount (MYR)", "Total Released Amount", "netPayout", "Net Payout", "Net amount", "net_amount", "Amount", "amount", "total-amount", "payout_amount", "Payout Amount"),
     "transaction_type": ("Transaction type", "Transaction Type", "View By", "transaction-type", "Type", "type"),
     "detail_items": ("Details of items sold", "details_of_items_sold", "Items", "item-details"),
     "currency": ("Currency", "Currency Code", "currency-code", "Settlement Currency", "币种", "货币"),
@@ -425,51 +433,61 @@ FIELD_ALIASES = {
 }
 
 
+def sheet_names(path):
+    if Path(path).suffix.lower() != ".xlsx":
+        return [""]
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read("xl/workbook.xml"))
+    return [node.attrib["name"] for node in root.findall(
+        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheets/"
+        "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet")]
+
+
 def rows_as_dicts(path, preferred_sheet="Order details"):
-    rows = read_tabular_rows(path, preferred_sheet)
-    if not rows:
-        return [], []
+    # Rank whole headers, rather than mistaking a section heading for row 1.
     known = {product_key(alias) for values in FIELD_ALIASES.values() for alias in values}
-    header_index = next((i for i, row in enumerate(rows) if sum(product_key(cell) in known for cell in row) >= 1), 0)
-    headers = [text(value) for value in rows[header_index]]
+    best = None
+    for sheet in sheet_names(path):
+        rows = read_tabular_rows(path, sheet)
+        if not rows:
+            continue
+        index = max(range(min(30, len(rows))), key=lambda i: sum(product_key(v) in known for v in rows[i]))
+        score = sum(product_key(v) in known for v in rows[index])
+        rank = (score, sheet.lower() == preferred_sheet.lower())
+        if best is None or rank > best[0]:
+            best = (rank, rows, index, sheet)
+    if best is None or best[0][0] < 2:
+        raise ValueError("找不到订单号和数据表头。请检查工作表及表头；不能凭文件名识别。")
+    _, rows, index, sheet = best
+    headers = [text(v) for v in rows[index]]
+    if len([h for h in headers if h]) != len(set(h for h in headers if h)):
+        raise ValueError("表头有重复名称，请先确认需要使用的金额栏。")
     output = []
-    for row in rows[header_index + 1:]:
-        row = row + [""] * max(0, len(headers) - len(row))
-        item = {headers[i]: row[i] for i in range(len(headers)) if headers[i]}
-        if any(text(value) for value in item.values()):
+    for line_number, row in enumerate(rows[index + 1:], index + 2):
+        item = {name: row[i] if i < len(row) else "" for i, name in enumerate(headers) if name}
+        if any(text(v) for v in item.values()):
+            item["_sheet"] = sheet
+            item["_row"] = getattr(rows, "source_row_numbers", range(1, len(rows) + 1))[line_number - 1]
             output.append(item)
-    return output, headers
+    return output, [h for h in headers if h]
 
 
 def detect_platform(income_path, orders_path):
-    """Infer the report family from distinctive headers, without guessing silently."""
-    _, income_headers = rows_as_dicts(income_path, "Income")
-    _, order_headers = rows_as_dicts(orders_path, "Orders")
-    income = {product_key(header) for header in income_headers}
-    orders = {product_key(header) for header in order_headers}
-    if {product_key("Order/Adjustment ID"), product_key("Total settlement amount")} <= income:
+    _, ih = rows_as_dicts(income_path)
+    _, oh = rows_as_dicts(orders_path)
+    inc, orders = {product_key(h) for h in ih}, {product_key(h) for h in oh}
+    if {"order/adjustment id", "total settlement amount"} <= inc:
         return "tiktok"
-    signatures = {
-        "shopee": ({"order_sn", "order id", "order_id"}, {"order_item_id", "item_id", "sku"}, {"net_income", "net_payout", "amount", "net amount"}),
-        "lazada": ({"order_id"}, {"seller_sku", "product_name", "item_title"}, {"amount", "net_amount", "payout_amount"}),
-        "ebay": ({"order_id"}, {"item_id", "title", "item_title"}, {"amount", "net_amount", "payout_amount"}),
-        "amazon": ({"order_id", "amazon order id"}, {"asin", "product_name", "sku"}, {"amount", "net_amount", "payout_amount"}),
-    }
-    candidates = []
-    for platform, (income_markers, order_markers, amount_markers) in signatures.items():
-        income_order = bool(income & income_markers)
-        order_item = bool(orders & order_markers)
-        settlement_amount = bool(income & amount_markers)
-        score = int(income_order) + int(order_item) + int(settlement_amount)
-        if score == 3:
-            candidates.append((score, platform))
-    if len(candidates) == 1:
-        return candidates[0][1]
-    if candidates:
-        candidates.sort(reverse=True)
-        if len(candidates) == 1 or candidates[0][0] > candidates[1][0]:
-            return candidates[0][1]
-    raise ValueError("无法可靠识别上传文件的平台报表格式。请确认上传的是同一平台的结算表和订单明细表。")
+    if any(h.startswith("total released amount") for h in inc) and ({"sku reference no.", "order_sn"} & orders):
+        return "shopee"
+    if {"ordernumber", "orderitemid", "sellersku"} <= orders and (
+        {"order_no", "amount"} <= inc or {"order number", "amount", "fee name"} <= inc):
+        return "lazada"
+    # Conservative support for explicit net-settlement exports.
+    for name, marker in (("amazon", "asin"), ("ebay", "item title"), ("shopee", "order_sn")):
+        if marker in orders and any(h in inc for h in ("net amount", "net_amount", "net payout")):
+            return name
+    raise ValueError("尚未识别此文件结构。需要确认订单号、净到账、商品和数量栏，不能将任意 Amount 当成到账。")
 
 
 def alias_value(row, key):
@@ -481,49 +499,101 @@ def alias_value(row, key):
     return ""
 
 
-def normalized_platform_reports(platform, income_path, orders_path):
-    """Translate non-TikTok exports to the shared order/settlement model."""
+def normalized_platform_reports(platform, income_path, orders_path, options=None):
+    options = options or {}
     income_rows, income_headers = rows_as_dicts(income_path, "Income")
-    order_rows, order_headers = rows_as_dicts(orders_path, "Orders")
+    order_rows, order_headers = rows_as_dicts(orders_path, "orders")
+    # Keep original row locations in every accepted settlement record.
+    if platform == "shopee":
+        grouped = defaultdict(list)
+        for row in income_rows:
+            grouped[alias_value(row, "order_id")].append(row)
+        selected = []
+        for order, rows in grouped.items():
+            order_view = [r for r in rows if text(r.get("View By")).lower() == "order"]
+            sku_view = [r for r in rows if text(r.get("View By")).lower() == "sku"]
+            if order_view and sku_view:
+                order_total = sum(strict_signed_money(alias_value(r, "settlement")) for r in order_view)
+                sku_total = sum(strict_signed_money(alias_value(r, "settlement")) for r in sku_view)
+                if abs(order_total - sku_total) > 0.005:
+                    raise ValueError(f"订单 {order} 的 Order 与 SKU 汇总金额不同，请核对，尚未计算。")
+                selected.extend(r for r in rows if r not in sku_view)
+            else:
+                selected.extend(rows)
+        income_rows = selected
+        if "Adjustment" in sheet_names(income_path):
+            raw = read_tabular_rows(income_path, "Adjustment")
+            if len(raw) > 1 and "Adjustment Amount (MYR)" in raw[0]:
+                choice = options.get("adjustments", "")
+                if choice not in ("included", "additional"):
+                    raise ValueError("发现 Adjustment 调整表。请在导入确认中指定：已包含在净到账，或需要额外计入。")
+                if choice == "additional":
+                    for n, values in enumerate(raw[1:], 2):
+                        row = dict(zip(raw[0], values))
+                        row["Amount"] = row.get("Adjustment Amount (MYR)", "")
+                        row["Transaction type"] = "Adjustment"
+                        row["_sheet"], row["_row"] = "Adjustment", n
+                        income_rows.append(row)
     normalized_income = []
     for row in income_rows:
         order_id = normalized_id(alias_value(row, "order_id"))
         if not order_id:
-            continue
-        transaction = alias_value(row, "transaction_type") or "Order"
+            raise ValueError(f"收支记录缺订单号：{row.get('_sheet')} 第 {row.get('_row')} 行。")
+        amount = strict_signed_money(alias_value(row, "settlement"))
+        if "Amount" in row and "Payout Amount" in row and text(row["Payout Amount"]):
+            if abs(amount - strict_signed_money(row["Payout Amount"])) > 0.005:
+                raise ValueError(f"订单 {order_id} 的 Amount 与 Payout Amount 不同，请确认净到账栏。")
+        transaction = alias_value(row, "transaction_type") or text(row.get("Fee Name")) or "Order"
         if platform == "shopee" and transaction.lower() in ("order", "sku"):
             transaction = "Order"
-        amount = alias_value(row, "settlement")
-        detail = alias_value(row, "detail_items")
-        qty = alias_value(row, "quantity")
-        if not detail and qty:
-            detail = f"item * {qty}"
+        currency = alias_value(row, "currency") or options.get("currency", "")
+        if not currency and any("(MYR)" in h or "(RM)" in h for h in income_headers):
+            currency = "MYR"
+        if not currency:
+            raise ValueError("文件没有明确币种，请在导入确认中选择币种。")
+        currency = currency.upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("币种必须为 MYR、USD 等三字母代码。")
         normalized_income.append({
-            "Related order ID": order_id,
-            "Order/Adjustment ID": order_id,
-            "Total settlement amount": amount,
-            "Transaction type": transaction,
-            "Details of items sold": detail,
-            "Currency": alias_value(row, "currency") or ("MYR" if platform in ("shopee", "lazada") else "USD"),
-            "_raw": row,
+            "Related order ID": order_id, "Order/Adjustment ID": order_id,
+            "Total settlement amount": amount, "Transaction type": transaction,
+            "Details of items sold": "", "Currency": currency,
+            "原始工作表": row.get("_sheet", ""), "原始行号": row.get("_row", ""),
+            "收支项目": text(row.get("fee_name") or row.get("Fee Name") or transaction),
+            "订单商品ID": alias_value(row, "order_item_id"), "_raw": row,
         })
-    normalized_orders = []
+    normalized_orders, seen = [], set()
     for row in order_rows:
         order_id = normalized_id(alias_value(row, "order_id"))
         if not order_id:
-            continue
+            raise ValueError(f"订单明细缺订单号：第 {row.get('_row')} 行。")
+        item_id = alias_value(row, "order_item_id")
+        if item_id:
+            if (order_id, item_id) in seen:
+                raise ValueError(f"重复订单商品ID：{order_id} / {item_id}，请核对后再分析。")
+            seen.add((order_id, item_id))
+        qty = alias_value(row, "quantity")
+        if not qty:
+            if item_id and options.get("item_is_unit") == "yes":
+                qty = "1"
+            else:
+                raise ValueError("All Orders 缺数量栏。若每个不同 Order Item ID 代表一件，请在导入确认中勾选。")
+        if not re.fullmatch(r"\d+(?:\.0+)?", qty):
+            raise ValueError(f"订单 {order_id} 数量无效：{qty}")
+        returned = alias_value(row, "return_quantity")
+        status = alias_value(row, "status")
+        return_status = text(row.get("Return / Refund Status"))
+        issues = []
+        if not returned and (any(word in status.lower() for word in ("return", "refund")) or return_status.lower() not in ("", "none", "no", "n/a", "-")):
+            issues.append("退货状态缺少明确退货件数，数量和成本待核对")
+        if returned and (not re.fullmatch(r"\d+(?:\.0+)?", returned) or float(returned) > float(qty)):
+            raise ValueError(f"订单 {order_id} 退货数量无效。")
         normalized_orders.append({
-            "Order ID": order_id,
-            "Order Item ID": alias_value(row, "order_item_id"),
-            "Product ID": alias_value(row, "product_id"),
-            "Product Name": alias_value(row, "product_name"),
-            "Variation": alias_value(row, "variation"),
-            "SKU ID": normalized_id(alias_value(row, "sku")),
-            "Quantity": alias_value(row, "quantity"),
-            "Sku Quantity of return": alias_value(row, "return_quantity"),
-            "Order created time": alias_value(row, "order_date"),
-            "Order Status": alias_value(row, "status"),
-            "_raw": row,
+            "Order ID": order_id, "Order Item ID": item_id,
+            "Product ID": alias_value(row, "product_id"), "Product Name": alias_value(row, "product_name"),
+            "Variation": alias_value(row, "variation"), "SKU ID": normalized_id(alias_value(row, "sku")),
+            "Quantity": qty, "Sku Quantity of return": returned or "0",
+            "Order created time": alias_value(row, "order_date"), "Order Status": status, "_raw": row, "_issues": issues,
         })
     return normalized_income, normalized_orders, income_headers, order_headers
 
@@ -541,9 +611,10 @@ def income_table(path):
     keep = [index for index, header in enumerate(raw_headers) if header and header not in SYSTEM_COLUMNS]
     headers = [raw_headers[index] for index in keep]
     output = []
-    for raw in rows[header_index + 1:]:
+    for position, raw in enumerate(rows[header_index + 1:], header_index + 1):
         item = {headers[pos]: (raw[index] if index < len(raw) else "") for pos, index in enumerate(keep)}
         if any(text(value) for value in item.values()):
+            item["_row"] = getattr(rows, "source_row_numbers", range(1, len(rows) + 1))[position]
             output.append(item)
     return output
 
@@ -687,12 +758,13 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         income = income_table(income_path)
         orders = table(orders_path, "OrderSKUList", "Order ID")
     else:
-        income, orders, _, _ = normalized_platform_reports(product_key(platform), income_path, orders_path)
+        income, orders, _, _ = normalized_platform_reports(product_key(platform), income_path, orders_path, app_state.get("import_options"))
     report_currency = detect_currency(income)
 
     source_columns = [key for key in (list(income[0].keys()) if income else []) if not key.startswith("_")]
     settlements = defaultdict(lambda: {"net": 0.0, "details_units": 0, "types": set(), "rows": 0, "source": defaultdict(list)})
     income_items = defaultdict(lambda: defaultdict(int))
+    audit_entries = defaultdict(list)
     for row in income:
         transaction_type = text(row.get("Transaction type"))
         key = normalized_id(row.get("Related order ID") or row.get("Order/Adjustment ID"))
@@ -700,6 +772,10 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             continue
         bucket = settlements[key]
         bucket["net"] += money(row.get("Total settlement amount"))
+        audit_entries[key].append({"sheet": row.get("原始工作表", "Income"),
+            "row": row.get("原始行号", row.get("_row", "")),
+            "item_id": row.get("订单商品ID", ""), "description": row.get("收支项目", transaction_type),
+            "amount": money(row.get("Total settlement amount"))})
         bucket["details_units"] += detail_quantity(row.get("Details of items sold"))
         bucket["types"].add(transaction_type or "Unknown")
         bucket["rows"] += 1
@@ -733,6 +809,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             if variation and variation not in variations:
                 variations.append(variation)
         presentation = {
+            "settlement_entries": audit_entries[order_id],
             "product_name": "\n".join(product_names),
             "variation": "\n".join(variations),
             "source": {field: "\n".join(values) for field, values in settlement["source"].items()},
@@ -746,7 +823,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                 "quantity_source": "Income", "editable": True, **presentation,
             })
             continue
-        flags = []
+        flags = [issue for line in order_lines for issue in line.get("_issues", [])]
         lifecycle = order_lifecycle(order_lines)
         # All Orders is the line-level authority: it contains every variation
         # and its quantity. Income remains authoritative for settlement money.
@@ -814,8 +891,8 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
             # A merchant-entered product cost is the final confirmation for a
             # special order (for example a gift bundle). Do not keep it in
             # Needs review merely because automatic line matching is absent.
-            flags = []
-        refund_only = lifecycle["returned"] and not any(text(kind).lower().startswith("order") for kind in settlement["types"])
+            flags = [issue for line in order_lines for issue in line.get("_issues", [])]
+        refund_only = platform_name in ("", "tiktok", "tiktok shop") and lifecycle["returned"] and not any(text(kind).lower().startswith("order") for kind in settlement["types"])
         if refund_only and override_cost is None:
             # The original sale was settled in an earlier report. Its COGS was
             # already recognised then; this report must not deduct it again.
@@ -892,38 +969,32 @@ def write_csv(report):
 def write_generic_augmented_xlsx(income_path, orders_path, app_state, platform):
     if xlsxwriter is None:
         raise RuntimeError("服务器缺少 Excel 导出组件。")
-    income, orders, income_headers, _ = normalized_platform_reports(product_key(platform), income_path, orders_path)
     result = analyse(income_path, orders_path, app_state, platform)
-    by_order = {item["order_id"]: item for item in result["orders"]}
-    headers = [header for header in income_headers if header] + ["商品名称", "Variation", "SKU", "实际数量", "商品成本", "其他", "总成本", "纯利润", "核对状态"]
+    REPORTS.mkdir(exist_ok=True)
     output = REPORTS / report_filename(platform)
-    workbook = xlsxwriter.Workbook(output)
-    sheet = workbook.add_worksheet("Income with Profit")
-    header_format = workbook.add_format({"bg_color": "#4A37B8", "font_color": "#FFFFFF", "bold": True, "text_wrap": True, "border": 1})
-    cell_format = workbook.add_format({"text_wrap": True, "border": 1})
-    number_format = workbook.add_format({"num_format": "0.00", "border": 1})
-    for col, header in enumerate(headers):
-        sheet.write(0, col, header, header_format)
-    normalized_by_order = defaultdict(list)
-    for line in orders:
-        normalized_by_order[line["Order ID"]].append(line)
-    for index, source in enumerate(income, start=1):
-        order_id = source["Related order ID"]
-        item = by_order.get(order_id, {})
-        lines = normalized_by_order.get(order_id, [])
-        names = "\n".join(dict.fromkeys(text(line.get("Product Name")) for line in lines if text(line.get("Product Name"))))
-        variations = "\n".join(dict.fromkeys(text(line.get("Variation")) for line in lines if text(line.get("Variation"))))
-        skus = "\n".join(dict.fromkeys(text(line.get("SKU ID")) for line in lines if text(line.get("SKU ID"))))
-        values = [source.get(header, source.get("_raw", {}).get(header, "")) for header in income_headers]
-        values += [names, variations, skus, item.get("actual_units", ""), item.get("cost", ""), item.get("other_cost", 0), item.get("total_cost", item.get("cost", "")), item.get("profit", ""), item.get("status", "")]
-        for col, value in enumerate(values):
-            if headers[col] in ("商品成本", "其他", "总成本", "纯利润") and value not in ("", None):
-                sheet.write_number(index, col, float(value), number_format)
-            else:
-                sheet.write(index, col, value, cell_format)
-    sheet.freeze_panes(1, 0)
-    sheet.set_column(0, len(headers) - 1, 18)
-    workbook.close()
+    # Costs/profits appear once per order. Raw fee rows remain on a separate sheet.
+    with xlsxwriter.Workbook(output, {"constant_memory": True, "strings_to_formulas": False,
+                                       "strings_to_urls": False}) as workbook:
+        sheet = workbook.add_worksheet("Orders")
+        headers = ["Order ID", "Product", "Variation", "Units", "Settlement", "Product cost",
+                   "Other", "Total cost", "Profit", "Status", "Review"]
+        sheet.write_row(0, 0, headers)
+        for n, item in enumerate(result["orders"], 1):
+            sheet.write_row(n, 0, [item[k] for k in ("order_id", "product_name", "variation",
+                "actual_units", "net_settlement", "cost", "other_cost", "total_cost",
+                "profit", "status", "flags")])
+        sheet.freeze_panes(1, 1)
+        sheet.set_column(0, 2, 26)
+        detail = workbook.add_worksheet("Settlement audit")
+        detail.write_row(0, 0, ["Order ID", "Sheet", "Row", "Item ID", "Description", "Signed amount"])
+        n = 1
+        for item in result["orders"]:
+            for entry in item.get("settlement_entries", []):
+                detail.write_row(n, 0, [item["order_id"], entry["sheet"], entry["row"],
+                                       entry["item_id"], entry["description"], entry["amount"]])
+                n += 1
+        detail.freeze_panes(1, 0)
+        detail.set_column(0, 5, 24)
     return output
 
 
@@ -933,7 +1004,7 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
     income = income_table(income_path)
     orders = table(orders_path, "OrderSKUList", "Order ID")
     report_currency = detect_currency(income)
-    original_headers = list(income[0].keys())
+    original_headers = [key for key in income[0] if not key.startswith("_")]
     # TikTok changes report columns between exports/regions. When the
     # optional Total Revenue column is absent, append calculated columns.
     insert_at = original_headers.index("Total Revenue") + 1 if "Total Revenue" in original_headers else len(original_headers)
@@ -1120,13 +1191,11 @@ def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok")
 
 def refresh_current_report(app_state):
     """Rebuild the currently open report after a cost change, if one exists."""
-    income_path = next((path for path in DATA.glob("latest_income.*") if path.suffix.lower() in (".xlsx", ".csv", ".tsv")), DATA / "latest_income.xlsx")
-    orders_path = next((path for path in DATA.glob("latest_orders.*") if path.suffix.lower() in (".xlsx", ".csv", ".tsv")), DATA / "latest_orders.xlsx")
+    income_path, orders_path = latest_report_paths()
     if not income_path.exists() or not orders_path.exists():
         return None
     platform = app_state.get("active_platform", "tiktok")
     result = analyse(income_path, orders_path, app_state, platform)
-    write_augmented_xlsx(income_path, orders_path, app_state, platform)
     write_csv(result)
     return result
 
@@ -1145,7 +1214,7 @@ def cost_catalog(app_state):
     active_platform = product_key(app_state.get("active_platform", "tiktok"))
     if active_platform not in ("", "tiktok", "tiktok shop"):
         try:
-            generic_income, generic_orders, _, _ = normalized_platform_reports(active_platform, income_path, path)
+            generic_income, generic_orders, _, _ = normalized_platform_reports(active_platform, income_path, path, app_state.get("import_options"))
         except Exception:
             return []
         income_ids = {normalized_id(row.get("Order ID") or row.get("Related order ID")) for row in generic_income}
@@ -1238,6 +1307,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_GET(self):
+        # Downloads must use one coherent state, not a half-replaced upload.
+        with REPORT_LOCK:
+            self.handle_get()
+
+    def handle_get(self):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             self.send_response(HTTPStatus.OK)
@@ -1255,9 +1329,18 @@ class Handler(BaseHTTPRequestHandler):
             self.json({"items": cost_catalog(state())})
             return
         if parsed.path == "/api/download/latest":
-            current_platform = product_key(state().get("active_platform", "tiktok"))
+            current = state()
+            current_platform = product_key(current.get("active_platform", "tiktok"))
             filename = report_filename(current_platform)
-            path = REPORTS / filename
+            income_path, orders_path = latest_report_paths()
+            if not income_path.exists() or not orders_path.exists():
+                self.json({"error": "上传文件已不在服务器，请重新分析文件。"}, HTTPStatus.NOT_FOUND)
+                return
+            try:
+                path = write_augmented_xlsx(income_path, orders_path, current, current_platform)
+            except Exception as error:
+                self.json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
             if not path.exists():
                 self.json({"error": "尚未生成报告"}, HTTPStatus.NOT_FOUND)
                 return
@@ -1311,6 +1394,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_POST(self):
+        # Serialize read-modify-save and report refresh as one transaction in
+        # this single-process server; concurrent saves must not lose costs.
+        with REPORT_LOCK:
+            self.handle_post()
+
+    def handle_post(self):
         if not self.require_access():
             return
         try:
@@ -1342,21 +1431,27 @@ class Handler(BaseHTTPRequestHandler):
                     if requested_platform != "auto" and requested_platform != detected_platform:
                         raise ValueError(f"文件检测为 {detected_platform} 报表，与选择的平台不一致。")
                     platform = detected_platform
+                    current = state()
+                    current["import_options"] = {key: text(form.getfirst(key)) for key in
+                        ("currency", "adjustments", "item_is_unit")}
+                    report_hash = hashlib.sha256()
+                    for name in ("income", "orders"):
+                        with paths[name].open("rb") as source:
+                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                report_hash.update(chunk)
+                    report_id = report_hash.hexdigest()
+                    current["active_report_id"] = report_id
+                    current["active_platform"] = platform
+                    if current.get("override_report_id") != report_id:
+                        current["order_overrides"] = {}
+                    result = analyse(paths["income"], paths["orders"], current, platform)
                     DATA.mkdir(exist_ok=True)
                     for name, path in paths.items():
                         for old in DATA.glob(f"latest_{name}.*"):
                             if old.suffix.lower() in (".xlsx", ".csv", ".tsv"):
                                 old.unlink()
                         shutil.copyfile(path, DATA / f"latest_{name}{path.suffix.lower()}")
-                    report_id = hashlib.sha256(paths["income"].read_bytes() + paths["orders"].read_bytes()).hexdigest()
-                    current = state()
-                    current["active_report_id"] = report_id
-                    current["active_platform"] = platform
-                    if current.get("override_report_id") != report_id:
-                        current["order_overrides"] = {}
                     save_state(current)
-                    result = analyse(paths["income"], paths["orders"], current, platform)
-                    write_augmented_xlsx(paths["income"], paths["orders"], current, platform)
                     write_csv(result)
                 self.json(result)
                 return
@@ -1434,21 +1529,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请先重新分析两份 Excel。")
                 platform = current.get("active_platform", "tiktok")
                 result = analyse(income_path, orders_path, current, platform)
-                write_augmented_xlsx(income_path, orders_path, current, platform)
                 write_csv(result)
                 self.json(result)
                 return
-            if self.path == "/api/cost":
-                sku_id = normalized_id(payload.get("sku_id"))
+            if self.path in ("/api/cost", "/api/cost-batch"):
+                raw_ids = payload.get("sku_ids") if self.path == "/api/cost-batch" else [payload.get("sku_id")]
+                if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 10000:
+                    raise ValueError("请选择需要保存成本的规格。")
+                sku_ids = list(dict.fromkeys(normalized_id(value) for value in raw_ids))
                 amount = strict_money(payload.get("amount"))
                 currency = text(payload.get("currency")) or "MYR"
-                if not sku_id or not re.fullmatch(r"[A-Za-z]{3}", currency):
-                    raise ValueError("请提供 TikTok SKU ID 与非负成本。")
+                if not all(sku_ids) or not re.fullmatch(r"[A-Za-z]{3}", currency):
+                    raise ValueError("请提供有效规格 ID、币种与非负成本。")
                 current = state()
                 active_platform = product_key(current.get("active_platform", "tiktok"))
                 cost_bucket = current["costs"] if active_platform in ("", "tiktok", "tiktok shop") else current.setdefault("platform_costs", {}).setdefault(active_platform, {})
-                entries = cost_bucket.setdefault(sku_id, [])
-                save_cost_entry(entries, amount, text(payload.get("effective_from")) or "1900/01/01", text(payload.get("note")), currency)
+                for sku_id in sku_ids:
+                    entries = cost_bucket.setdefault(sku_id, [])
+                    save_cost_entry(entries, amount, text(payload.get("effective_from")) or "1900/01/01", text(payload.get("note")), currency)
                 save_state(current)
                 self.json({"ok": True, "result": refresh_current_report(current)})
                 return
@@ -1470,7 +1568,11 @@ class Handler(BaseHTTPRequestHandler):
                 _, orders_path = latest_report_paths()
                 if orders_path.exists():
                     try:
-                        order_lines = table(orders_path, "OrderSKUList", "Order ID")
+                        if active_platform in ("", "tiktok", "tiktok shop"):
+                            order_lines = table(orders_path, "OrderSKUList", "Order ID")
+                        else:
+                            income_path, _ = latest_report_paths()
+                            _, order_lines, _, _ = normalized_platform_reports(active_platform, income_path, orders_path, current.get("import_options"))
                     except Exception:
                         order_lines = []
                     matching_skus = {
@@ -1505,7 +1607,6 @@ class Handler(BaseHTTPRequestHandler):
                 if income_path.exists() and orders_path.exists():
                     platform = current.get("active_platform", "tiktok")
                     result = analyse(income_path, orders_path, current, platform)
-                    write_augmented_xlsx(income_path, orders_path, current, platform)
                     write_csv(result)
                     self.json({"ok": True, "rules": rules, "result": result})
                 else:
