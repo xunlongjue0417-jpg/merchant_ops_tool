@@ -46,6 +46,17 @@
       <label class="file-picker"><span data-i18n="incomeLabel">Settlement report</span><input name="income" type="file" accept=".xlsx,.csv,.tsv" required><span class="file-name" data-empty-file="fileNone">No file selected</span></label>
       <label class="file-picker"><span data-i18n="ordersLabel">Order details report</span><input name="orders" type="file" accept=".xlsx,.csv,.tsv" required><span class="file-name" data-empty-file="fileNone">No file selected</span></label>
       <button data-i18n="analyseButton">Analyze</button>
+      <details class="import-confirmation">
+        <summary>导入确认 / Import confirmations</summary>
+        <p>只有文件缺少资料或含调整表时才需填写。不确定就保留未确认，系统会停止并说明原因。</p>
+        <label>文件未注明币种时 / Currency if missing
+          <select name="currency"><option value="">未确认 / Not confirmed</option><option>MYR</option><option>USD</option><option>SGD</option><option>GBP</option><option>EUR</option></select>
+        </label>
+        <label>Adjustment 调整表的金额 / Adjustment sheet
+          <select name="adjustments"><option value="">未确认 / Not confirmed</option><option value="included">已包含在主表净到账 / Already included</option><option value="additional">主表未包含，额外计入 / Add separately</option></select>
+        </label>
+        <label><input type="checkbox" name="item_is_unit" value="yes">确认：没有数量栏时，每个不同 Order Item ID 代表一件商品 / Each item ID represents one unit</label>
+      </details>
     </form>
     <div id="summary"></div>
     <p><a id="download" hidden href="/api/download/latest" data-i18n="downloadExcel">Download Excel report</a>　<a id="download-csv" hidden href="/api/download/csv" data-i18n="downloadCsv">Download current order results (CSV)</a></p>
@@ -67,6 +78,7 @@
     <details><summary data-i18n="manualCostSummary">Manual cost entry (only for special cases)</summary><form id="cost"><label data-i18n="platformSkuLabel">Platform SKU ID<input name="sku_id" required></label><label data-i18n="unitCostLabel">Unit cost (RM)<input name="amount" type="number" min="0" step="0.01" required></label><label data-i18n="effectiveFromLabel">Effective date<input name="effective_from" placeholder="2026/08/01"></label><label data-i18n="noteLabel">Note<input name="note"></label><button data-i18n="saveCostButton">Save cost</button></form></details>
   </section>
 </main>
-<script src="app.js?v=20261002-16"></script>
+<dialog id="audit-dialog"><h3>收支来源 / Settlement audit</h3><pre id="audit-content" style="white-space:pre-wrap;max-height:65vh;overflow:auto"></pre><form method="dialog"><button>关闭 / Close</button></form></dialog>
+<script src="app.js?v=20261006-1"></script>
 </body>
 </html>
