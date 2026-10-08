@@ -142,7 +142,7 @@ window.MERCHANT_I18N = {
       "export_order_id": "Order ID",
       "export_currency": "Currency",
       "export_net_settlement": "Settlement",
-      "export_actual_units": "Order units",
+      "export_actual_units": "Net sold units",
       "export_details_units": "Settlement detail units",
       "export_quantity_source": "Quantity source",
       "export_cost": "Product cost",
@@ -174,7 +174,15 @@ window.MERCHANT_I18N = {
       "expandPanel": "Expand",
       "costEmpty": "Analyze your files to list products and variation costs here.",
       "emptyReportTitle": "Your order report will appear here",
-      "emptyReportHint": "Select the settlement and order detail files above, then click Analyze."
+      "emptyReportHint": "Select the settlement and order detail files above, then click Analyze.",
+      "purchasedUnits": "Purchased units",
+      "returnedUnits": "Returned units",
+      "netUnits": "Net sold units",
+      "allOrders": "All orders",
+      "clearAllFilters": "Clear all filters",
+      "shownCount": "Showing {shown} / {total} orders",
+      "export_purchased_units": "Purchased units",
+      "export_returned_units": "Returned units"
     },
     "zh": {
       "appTitle": "商家利润核对工具",
@@ -318,7 +326,7 @@ window.MERCHANT_I18N = {
       "export_order_id": "订单",
       "export_currency": "币种",
       "export_net_settlement": "到账",
-      "export_actual_units": "订单件数",
+      "export_actual_units": "净售件数",
       "export_details_units": "结算件数",
       "export_quantity_source": "数量来源",
       "export_cost": "商品成本",
@@ -350,7 +358,15 @@ window.MERCHANT_I18N = {
       "expandPanel": "展开",
       "costEmpty": "分析文件后，这里会列出商品及规格成本。",
       "emptyReportTitle": "订单报表将在这里显示",
-      "emptyReportHint": "先在上方选择结算报表和订单明细，再点击分析。"
+      "emptyReportHint": "先在上方选择结算报表和订单明细，再点击分析。",
+      "purchasedUnits": "购买件数",
+      "returnedUnits": "退货件数",
+      "netUnits": "净售件数",
+      "allOrders": "全部订单",
+      "clearAllFilters": "清除全部筛选",
+      "shownCount": "显示 {shown} / {total} 笔订单",
+      "export_purchased_units": "购买件数",
+      "export_returned_units": "退货件数"
     },
     "ms": {
       "appTitle": "Penyemak Untung Penjual",
@@ -494,7 +510,7 @@ window.MERCHANT_I18N = {
       "export_order_id": "ID pesanan",
       "export_currency": "Mata wang",
       "export_net_settlement": "Penyelesaian",
-      "export_actual_units": "Unit pesanan",
+      "export_actual_units": "Unit jualan bersih",
       "export_details_units": "Unit butiran penyelesaian",
       "export_quantity_source": "Sumber kuantiti",
       "export_cost": "Kos produk",
@@ -526,7 +542,15 @@ window.MERCHANT_I18N = {
       "expandPanel": "Buka",
       "costEmpty": "Analisis fail untuk memaparkan produk dan kos variasi di sini.",
       "emptyReportTitle": "Laporan pesanan akan dipaparkan di sini",
-      "emptyReportHint": "Pilih fail penyelesaian dan butiran pesanan di atas, kemudian klik Analisis."
+      "emptyReportHint": "Pilih fail penyelesaian dan butiran pesanan di atas, kemudian klik Analisis.",
+      "purchasedUnits": "Unit dibeli",
+      "returnedUnits": "Unit dipulangkan",
+      "netUnits": "Unit jualan bersih",
+      "allOrders": "Semua pesanan",
+      "clearAllFilters": "Kosongkan semua penapis",
+      "shownCount": "Memaparkan {shown} / {total} pesanan",
+      "export_purchased_units": "Unit dibeli",
+      "export_returned_units": "Unit dipulangkan"
     }
   },
   "system": [
