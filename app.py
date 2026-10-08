@@ -61,7 +61,6 @@ import re
 import secrets
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import time
@@ -73,13 +72,12 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 try:
     import xlsxwriter
 except ModuleNotFoundError:
-    # The existing Windows launcher includes the Node workbook generator.
-    # Render installs XlsxWriter from requirements.txt instead.
+    # Fail explicitly instead of falling back to a second calculation engine.
     xlsxwriter = None
 
 try:
@@ -95,9 +93,51 @@ STATE_PATH = DATA / "state.json"
 STATE_LOCK = threading.Lock()
 REPORT_LOCK = threading.RLock()
 ACCESS_PASSWORD = os.environ.get("APP_ACCESS_PASSWORD", "")
-LOCAL_NODE = Path(r"C:\Users\Win10\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_REQUEST_BYTES = 110 * 1024 * 1024
+
+
+# Data-only catalog is shared by the browser and Python; never execute JavaScript.
+I18N = json.loads((STATIC / "i18n.js").read_text(encoding="utf-8")
+                  .split("=", 1)[1].strip().removesuffix(";"))
+
+
+def language_code(value):
+    return value if value in ("zh", "en", "ms") else "zh"
+
+
+def tr(key, language="zh", *args):
+    template = I18N["messages"][language_code(language)][key]
+    return re.sub(r"\{(\d+)\}", lambda match: str(args[int(match[1])]), template) if args else template
+
+
+def translate_system_text(value, language="zh"):
+    """Translate system wording only. Never pass product names or raw source data."""
+    source = str(value or "")
+    if "；" in source and not any(entry["zh"] == source for entry in I18N["system"]):
+        return ("；" if language_code(language) == "zh" else "; ").join(
+            translate_system_text(part, language) for part in source.split("；"))
+    for entry in I18N["system"]:
+        pattern = "".join("(.*?)" if re.fullmatch(r"\{\d+\}", part) else re.escape(part)
+                          for part in re.split(r"(\{\d+\})", entry["zh"]))
+        match = re.fullmatch(pattern, source, re.S)
+        if match:
+            return re.sub(r"\{(\d+)\}", lambda token: match[int(token[1]) + 1],
+                          entry[language_code(language)])
+    if "；" in source:
+        return ("；" if language_code(language) == "zh" else "; ").join(
+            translate_system_text(part, language) for part in source.split("；"))
+    return source
+
+
+def localized_error(error, language):
+    source = str(error)
+    if source.startswith("下载失败：") and source.endswith("。未提供旧报告。"):
+        return tr("downloadWrapped", language, localized_error(source[len("下载失败："):-len("。未提供旧报告。")], language))
+    translated = translate_system_text(source, language)
+    if translated == source and translate_system_text(source, "en") == source:
+        return tr("unexpectedError", language)
+    return translated
 
 
 def default_state():
@@ -929,10 +969,24 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
     # order. Keep the report in that same order; the browser can still apply
     # an explicit sort when the user clicks a column header.
     confirmed = [row for row in report if row["profit"] is not None]
-    return {
+    # A negative settlement without complete costs is visible, but is NOT
+    # relabelled as final profit or removed from the existing review status.
+    for row in report:
+        row["loss_kind"] = ("confirmed_loss" if row["profit"] is not None and row["profit"] < 0
+                            else "pending_negative" if row["profit"] is None and row["net_settlement"] < 0 else "")
+        row["is_loss"] = bool(row["loss_kind"])
+        row["loss_label"] = {"confirmed_loss": "已确认亏损", "pending_negative": "负到账，最终亏损待核对"}.get(row["loss_kind"], "")
+    confirmed_losses = [row for row in report if row["loss_kind"] == "confirmed_loss"]
+    pending_negative = [row for row in report if row["loss_kind"] == "pending_negative"]
+    result = {
         "summary": {
             "settlement_total": round(sum(row["net_settlement"] for row in report), 2),
             "confirmed_profit": round(sum(row["profit"] for row in confirmed), 2),
+            "confirmed_orders": len(confirmed),
+            "loss_orders": len(confirmed_losses) + len(pending_negative),
+            "confirmed_loss_total": round(sum(row["profit"] for row in confirmed_losses), 2),
+            "pending_negative_total": round(sum(row["net_settlement"] for row in pending_negative), 2),
+            "pending_negative_orders": len(pending_negative),
             "confirmed_cost": round(sum(row.get("total_cost", row["cost"]) for row in confirmed), 2),
             "orders": len(report),
             "needs_review": sum(row["status"] == "需核对" for row in report),
@@ -944,259 +998,147 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
         "missing_costs": sorted(missing.values(), key=lambda item: item["product_name"]),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    fingerprint = {key: result[key] for key in ("summary", "orders", "source_columns")}
+    result["revision"] = hashlib.sha256(json.dumps(fingerprint, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return result
 
 
-def write_csv(report):
-    REPORTS.mkdir(exist_ok=True)
-    path = REPORTS / "latest_profit_report.csv"
-    columns = ["商品名称", "Variation", "订单", "币种", "到账", "订单件数", "结算件数", "数量来源", "商品成本", "其他", "总成本", "纯利润", "状态", "核对说明"] + report.get("source_columns", [])
-    with path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=columns)
-        writer.writeheader()
-        for item in report["orders"]:
-            row = {
-                "商品名称": item.get("product_name", ""), "Variation": item.get("variation", ""),
-                "订单": item["order_id"], "币种": report.get("summary", {}).get("currency", ""), "到账": item["net_settlement"], "订单件数": item["actual_units"],
-                "结算件数": item["details_units"], "数量来源": item.get("quantity_source", ""), "商品成本": item["cost"], "其他": item.get("other_cost", 0), "总成本": item.get("total_cost", item["cost"]),
-                "纯利润": "" if item["profit"] is None else item["profit"],
-                "状态": item["status"], "核对说明": item["flags"],
-            }
-            row.update(item.get("source", {}))
-            writer.writerow(row)
+EXPORT_FIELDS = [
+    ("商品名称", "product_name"), ("规格", "variation"), ("订单", "order_id"),
+    ("币种", "currency"), ("到账", "net_settlement"), ("订单件数", "actual_units"),
+    ("结算件数", "details_units"), ("数量来源", "quantity_source"),
+    ("商品成本", "cost"), ("其他", "other_cost"), ("总成本", "total_cost"),
+    ("纯利润", "profit"), ("状态", "status"), ("核对说明", "flags"),
+    ("亏损说明", "loss_label"),
+]
+
+
+def export_columns(report, language="zh"):
+    # Source amounts are evidence, not the merchant's edited report amounts.
+    return [tr("export_" + key, language) for _, key in EXPORT_FIELDS] + [
+        f"{tr('sourcePrefix', language)} · {name}" for name in report.get("source_columns", [])]
+
+
+def export_rows(report, language="zh"):
+    """The same saved-result fields feed CSV and Excel, without recalculation."""
+    for item in report["orders"]:
+        values = dict(item, currency=report["summary"]["currency"])
+        yield [translate_system_text(values.get(key), language) if key in ("status", "flags", "loss_label")
+               else values.get(key) for _, key in EXPORT_FIELDS] + [
+            item.get("source", {}).get(name, "") for name in report.get("source_columns", [])]
+
+
+def atomic_report_write(path, writer):
+    """Publish only a complete export; a failure cannot leave a partial file."""
+    path.parent.mkdir(exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="export-", suffix=path.suffix, dir=path.parent)
+    os.close(fd)
+    temporary = Path(temporary)
+    try:
+        writer(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
-def write_generic_augmented_xlsx(income_path, orders_path, app_state, platform):
+def write_csv(report, language="zh"):
+    def write(path):
+        with path.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(export_columns(report, language))
+            writer.writerows(export_rows(report, language))
+            stream.flush()
+            os.fsync(stream.fileno())
+    return atomic_report_write(REPORTS / "latest_profit_report.csv", write)
+
+
+def write_report_xlsx(report, platform, language="zh"):
+    """Export the web result verbatim. Profit is never recomputed in Excel."""
     if xlsxwriter is None:
-        raise RuntimeError("服务器缺少 Excel 导出组件。")
-    result = analyse(income_path, orders_path, app_state, platform)
-    REPORTS.mkdir(exist_ok=True)
-    output = REPORTS / report_filename(platform)
-    # Costs/profits appear once per order. Raw fee rows remain on a separate sheet.
-    with xlsxwriter.Workbook(output, {"constant_memory": True, "strings_to_formulas": False,
-                                       "strings_to_urls": False}) as workbook:
-        sheet = workbook.add_worksheet("Orders")
-        headers = ["Order ID", "Product", "Variation", "Units", "Settlement", "Product cost",
-                   "Other", "Total cost", "Profit", "Status", "Review"]
-        sheet.write_row(0, 0, headers)
-        for n, item in enumerate(result["orders"], 1):
-            sheet.write_row(n, 0, [item[k] for k in ("order_id", "product_name", "variation",
-                "actual_units", "net_settlement", "cost", "other_cost", "total_cost",
-                "profit", "status", "flags")])
-        sheet.freeze_panes(1, 1)
-        sheet.set_column(0, 2, 26)
-        detail = workbook.add_worksheet("Settlement audit")
-        detail.write_row(0, 0, ["Order ID", "Sheet", "Row", "Item ID", "Description", "Signed amount"])
-        n = 1
-        for item in result["orders"]:
-            for entry in item.get("settlement_entries", []):
-                detail.write_row(n, 0, [item["order_id"], entry["sheet"], entry["row"],
-                                       entry["item_id"], entry["description"], entry["amount"]])
-                n += 1
-        detail.freeze_panes(1, 0)
-        detail.set_column(0, 5, 24)
-    return output
+        raise RuntimeError("服务器缺少 Excel 导出组件，请安装 requirements.txt 中的 XlsxWriter。")
+
+    def write(path):
+        with xlsxwriter.Workbook(path, {"constant_memory": True, "strings_to_formulas": False,
+                                        "strings_to_urls": False}) as workbook:
+            workbook.set_properties({"comments": f"Report revision: {report.get('revision', '')}"})
+            heading = workbook.add_format({"bold": True, "bg_color": "#E2E8F0", "text_wrap": True})
+            wrapped = workbook.add_format({"text_wrap": True, "valign": "top"})
+            amount = workbook.add_format({"num_format": "0.00", "valign": "top"})
+            sheet = workbook.add_worksheet(tr("ordersSheet", language))
+            sheet.write_row(0, 0, export_columns(report, language), heading)
+            sheet.set_row(0, 32)
+            for n, values in enumerate(export_rows(report, language), 1):
+                for column, value in enumerate(values):
+                    sheet.write(n, column, value, amount if column in (4, 8, 9, 10, 11) else wrapped)
+            sheet.freeze_panes(1, 3)
+            sheet.set_column(0, 1, 32)
+            sheet.set_column(2, 2, 25)
+            sheet.set_column(3, 13, 18)
+            sheet.set_column(13, 13, 42)
+            sheet.set_column(14, 14, 32)
+            if report.get("source_columns"):
+                sheet.set_column(len(EXPORT_FIELDS), len(EXPORT_FIELDS) + len(report["source_columns"]) - 1, 24)
+            sheet.autofilter(0, 0, len(report["orders"]), len(export_columns(report, language)) - 1)
+            summary = workbook.add_worksheet(tr("summarySheet", language))
+            summary.write_row(0, 0, [tr("summaryTitle", language), tr("savedResult", language)], heading)
+            for n, (label, key) in enumerate([
+                ("币种", "currency"), ("结算总额", "settlement_total"),
+                ("已确认总成本", "confirmed_cost"), ("已确认纯利润", "confirmed_profit"),
+                ("订单数", "orders"), ("需核对订单数", "needs_review"),
+                ("已确认订单数", "confirmed_orders"), ("亏损订单数（含待核对负到账）", "loss_orders"),
+                ("已确认亏损合计", "confirmed_loss_total"), ("待核对负到账合计（非最终利润）", "pending_negative_total")], 1):
+                summary_keys = {"currency": "export_currency", "settlement_total": "summarySettlement",
+                                "confirmed_cost": "summaryCost", "confirmed_profit": "summaryProfit",
+                                "orders": "summaryOrders", "needs_review": "summaryNeedsReview",
+                                "confirmed_orders": "summary_confirmed_orders", "loss_orders": "summary_loss_orders",
+                                "confirmed_loss_total": "summary_confirmed_loss_total",
+                                "pending_negative_total": "summary_pending_negative_total"}
+                summary.write(n, 0, tr(summary_keys[key], language), wrapped)
+                value = report["summary"][key]
+                if key == "confirmed_profit" and not report["summary"]["confirmed_orders"]:
+                    value = "—"
+                    summary.write(n, 2, tr("noConfirmedProfit", language), wrapped)
+                summary.write(n, 1, value, amount if n in (2, 3, 4, 9, 10) else wrapped)
+            summary.set_column(0, 1, 28)
+            summary.set_column(2, 2, 42)
+            detail = workbook.add_worksheet(tr("auditSheet", language))
+            detail.write_row(0, 0, [tr(key, language) for key in ("audit_order", "audit_sheet", "audit_row",
+                                   "audit_item", "audit_description", "audit_amount")], heading)
+            n = 1
+            for item in report["orders"]:
+                for entry in item.get("settlement_entries", []):
+                    detail.write_row(n, 0, [item["order_id"], entry["sheet"], entry["row"],
+                                           entry["item_id"], entry["description"], entry["amount"]], wrapped)
+                    n += 1
+            detail.freeze_panes(1, 1)
+            detail.set_column(0, 4, 26)
+            detail.set_column(5, 5, 24, amount)
+    return atomic_report_write(REPORTS / report_filename(platform), write)
 
 
 def write_augmented_xlsx(income_path, orders_path, app_state, platform="tiktok"):
-    if product_key(platform) not in ("", "tiktok", "tiktok shop"):
-        return write_generic_augmented_xlsx(income_path, orders_path, app_state, platform)
-    income = income_table(income_path)
-    orders = table(orders_path, "OrderSKUList", "Order ID")
-    report_currency = detect_currency(income)
-    original_headers = [key for key in income[0] if not key.startswith("_")]
-    # TikTok changes report columns between exports/regions. When the
-    # optional Total Revenue column is absent, append calculated columns.
-    insert_at = original_headers.index("Total Revenue") + 1 if "Total Revenue" in original_headers else len(original_headers)
-    added = ["商品名称", "Variation", "实际数量", "商品成本", "其他", "总成本", "纯利润", "核对状态"]
-    headers = original_headers[:insert_at] + added + original_headers[insert_at:]
-    by_order = defaultdict(list)
-    for line in orders:
-        by_order[normalized_id(line.get("Order ID"))].append(line)
-    totals = defaultdict(lambda: {"net": 0.0, "types": set(), "details": 0})
-    for source in income:
-        order_id = normalized_id(source.get("Related order ID") or source.get("Order/Adjustment ID"))
-        totals[order_id]["net"] += money(source.get("Total settlement amount"))
-        totals[order_id]["types"].add(text(source.get("Transaction type")))
-        totals[order_id]["details"] += detail_quantity(source.get("Details of items sold"))
-    rows, seen, profit_net_overrides = [], set(), {}
-    for source in income:
-        order_id = normalized_id(source.get("Related order ID") or source.get("Order/Adjustment ID"))
-        transaction = text(source.get("Transaction type")).lower()
-        names, variations, quantity, cost_total, flags = [], [], 0, 0.0, []
-        total_cost = ""
-        lifecycle = order_lifecycle(by_order.get(order_id, []))
-        override = manual_override(app_state, order_id)
-        net_settlement = money(override["net_settlement"]) if "net_settlement" in override else totals[order_id]["net"]
-        other = money(override.get("other_cost", 0))
-        if transaction == "logistics reimbursement":
-            status = "物流补偿，已计入"
-            cost = 0.0
-            total_cost = other
-            profit = round(net_settlement - total_cost, 2)
-        elif order_id in seen:
-            status = "同订单调整行；成本已在首次订单行计算"
-            cost = other = total_cost = profit = ""
-        elif lifecycle["cancelled"]:
-            seen.add(order_id)
-            status = "已取消"
-            cost = other = total_cost = profit = ""
-        elif not by_order.get(order_id):
-            seen.add(order_id)
-            cost = money(override["cost"]) if "cost" in override else ""
-            total_cost = round(cost + other, 2) if isinstance(cost, float) else ""
-            profit = round(net_settlement - total_cost, 2) if isinstance(total_cost, float) else ""
-            status = "退款/订单缺商品明细；请在网页手动填总成本" if cost == "" else "手动成本已用于计算"
-        else:
-            seen.add(order_id)
-            missing = False
-            for line in by_order[order_id]:
-                units = max(0, number(line.get("Quantity")) - number(line.get("Sku Quantity of return")))
-                if not units:
-                    continue
-                name, variation = text(line.get("Product Name")), text(line.get("Variation"))
-                names.append(f"{display_product_name(name, app_state)} ×{units}")
-                variations.append(f"{variation} ×{units}")
-                quantity += units
-                date = text(line.get("Order created time") or line.get("Created Time"))
-                item_cost = choose_cost(app_state.get("costs", {}).get(normalized_id(line.get("SKU ID")), []), date, report_currency)
-                item_cost = item_cost or choose_cost(app_state.get("product_costs", {}).get(product_key(name), []), date, report_currency)
-                if item_cost is None:
-                    missing = True
-                else:
-                    cost_total += units * money(item_cost.get("amount"))
-            if "cost" in override:
-                cost_total = money(override["cost"])
-                missing = False
-                flags = []
-            if missing:
-                flags.append("缺成本")
-            details = totals[order_id]["details"]
-            if details and details != quantity and not (lifecycle["returned"] and quantity == 0):
-                flags.append(f"数量不一致：订单 {quantity} 件，结算详情 {details} 件")
-            refund_only = lifecycle["returned"] and not any(text(kind).lower().startswith("order") for kind in totals[order_id]["types"])
-            if refund_only and "cost" not in override:
-                cost_total = 0.0
-                flags = [flag for flag in flags if flag != "缺成本"]
-            cost = "" if missing else round(cost_total, 2)
-            total_cost = round(cost_total + other, 2)
-            profit_value = None if flags else round(net_settlement - total_cost, 2)
-            profit = "" if profit_value is None else profit_value
-            if flags:
-                status = "；".join(flags)
-            elif lifecycle["returned"]:
-                status = "已退货退款" if quantity == 0 else f"部分退货退款（净售 {quantity} 件）"
-            elif is_refund_transaction(totals[order_id]["types"]):
-                status = "退款结算影响"
-            else:
-                status = "可确认"
-        base = [
-            normalized_id(source.get(header, "")) if header in {"Order/Adjustment ID", "Related order ID"} else source.get(header, "")
-            for header in original_headers
-        ]
-        if "net_settlement" in override and profit != "" and status != "已取消":
-            status = f"{status}；手动到账已用于利润"
-        if total_cost == "":
-            total_cost = "" if cost == "" else round(money(cost) + money(other), 2)
-        extra = ["\n".join(names), "\n".join(variations), quantity if names else "", cost, other, total_cost, profit, status]
-        rows.append(base[:insert_at] + extra + base[insert_at:])
-        if "net_settlement" in override and profit != "":
-            profit_net_overrides[str(len(rows) - 1)] = net_settlement
-    REPORTS.mkdir(exist_ok=True)
-    output = REPORTS / "TikTok_Income_with_Profit.xlsx"
-    if xlsxwriter is None:
-        if not LOCAL_NODE.exists():
-            raise RuntimeError("缺少 Excel 导出组件。请重新运行启动工具，或在服务器安装 requirements.txt。")
-        payload = REPORTS / "augmented_payload.json"
-        payload.write_text(json.dumps({"headers": headers, "rows": rows, "profitNetOverrides": profit_net_overrides}, ensure_ascii=False), encoding="utf-8")
-        subprocess.run([str(LOCAL_NODE), str(ROOT / "build_augmented_income.mjs"), str(payload), str(output)], check=True, capture_output=True, text=True)
-        return output
-    workbook = xlsxwriter.Workbook(output)
-    worksheet = workbook.add_worksheet("Order details")
-    worksheet.hide_gridlines(2)
-    worksheet.freeze_panes(1, 0)
+    return write_report_xlsx(analyse(income_path, orders_path, app_state, platform), platform)
 
-    header_format = workbook.add_format({"bg_color": "#4A37B8", "font_color": "#FFFFFF", "bold": True, "font_name": "Arial", "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1, "border_color": "#D9D9E6"})
-    detail_header_format = workbook.add_format({"bg_color": "#176B87", "font_color": "#FFFFFF", "bold": True, "font_name": "Arial", "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1, "border_color": "#D9D9E6"})
-    cell_format = workbook.add_format({"font_name": "Arial", "font_size": 10, "valign": "vcenter", "text_wrap": True, "border": 1, "border_color": "#D9D9E6"})
-    number_format = workbook.add_format({"font_name": "Arial", "font_size": 10, "valign": "vcenter", "text_wrap": True, "border": 1, "border_color": "#D9D9E6", "num_format": "0.00"})
-    text_id_format = workbook.add_format({"font_name": "Arial", "font_size": 10, "valign": "vcenter", "text_wrap": True, "border": 1, "border_color": "#D9D9E6", "num_format": "@"})
-    total_format = workbook.add_format({"bg_color": "#EEF2FF", "font_color": "#172554", "bold": True, "font_name": "Arial", "valign": "vcenter", "border": 1, "border_color": "#D9D9E6", "num_format": "0.00"})
-    total_label_format = workbook.add_format({"bg_color": "#EEF2FF", "font_color": "#172554", "bold": True, "font_name": "Arial", "valign": "vcenter", "border": 1, "border_color": "#D9D9E6"})
 
-    start = headers.index("商品名称")
-    for index, header in enumerate(headers):
-        worksheet.write(0, index, header, detail_header_format if start <= index < start + 6 else header_format)
-    numeric_headers = {"Total settlement amount", "Total Revenue", "商品成本", "其他", "总成本", "纯利润"}
-    for row_index, row in enumerate(rows, start=1):
-        for column_index, value in enumerate(row):
-            header = headers[column_index]
-            if header == "Order/Adjustment ID":
-                worksheet.write_string(row_index, column_index, str(value or ""), text_id_format)
-            elif header in numeric_headers and value != "":
-                try:
-                    worksheet.write_number(row_index, column_index, float(str(value).replace(",", "")), number_format)
-                except ValueError:
-                    worksheet.write(row_index, column_index, value, cell_format)
-            else:
-                worksheet.write(row_index, column_index, value, cell_format)
-
-    def excel_column(index):
-        result = ""
-        number = index + 1
-        while number:
-            number, remainder = divmod(number - 1, 26)
-            result = chr(65 + remainder) + result
-        return result
-
-    order_index = headers.index("Order/Adjustment ID")
-    settlement_index = headers.index("Total settlement amount")
-    cost_index = headers.index("商品成本")
-    other_index = headers.index("其他")
-    total_cost_index = headers.index("总成本")
-    profit_index = headers.index("纯利润")
-    status_index = headers.index("核对状态")
-    for row_index, row in enumerate(rows, start=1):
-        status = str(row[status_index] or "")
-        profit_value = row[profit_index]
-        if profit_value == "" or not any(status.startswith(label) for label in ("可确认", "已退货退款", "部分退货退款", "退款结算影响", "物流补偿", "手动成本已用于计算")):
-            continue
-        excel_row = row_index + 1
-        override_net = profit_net_overrides.get(str(row_index - 1))
-        if override_net is not None:
-            net_expression = str(float(override_net))
-        else:
-            net_expression = f'SUMIF(${excel_column(order_index)}$2:${excel_column(order_index)}${len(rows) + 1},{excel_column(order_index)}{excel_row},${excel_column(settlement_index)}$2:${excel_column(settlement_index)}${len(rows) + 1})'
-        worksheet.write_formula(row_index, total_cost_index, f"={excel_column(cost_index)}{excel_row}+{excel_column(other_index)}{excel_row}", number_format)
-        worksheet.write_formula(row_index, profit_index, f"={net_expression}-{excel_column(total_cost_index)}{excel_row}", number_format)
-
-    summary_row = len(rows) + 2
-    worksheet.write(summary_row, order_index, "总计", total_label_format)
-    revenue_index = headers.index("Total Revenue") if "Total Revenue" in headers else None
-    summary_indexes = [settlement_index, cost_index, profit_index]
-    if revenue_index is not None:
-        summary_indexes.insert(1, revenue_index)
-    for index in summary_indexes:
-        column = excel_column(index)
-        worksheet.write_formula(summary_row, index, f"=SUM({column}2:{column}{len(rows) + 1})", total_format)
-
-    worksheet.set_column(0, 0, 23, text_id_format)
-    worksheet.set_column(start, start, 34)
-    worksheet.set_column(start + 1, start + 1, 20)
-    worksheet.set_column(start + 2, start + 4, 14)
-    worksheet.set_column(start + 5, start + 5, 32)
-    workbook.close()
-    return output
+# Compatibility name for existing callers; there is only one Excel writer.
+write_generic_augmented_xlsx = write_augmented_xlsx
 
 
 def refresh_current_report(app_state):
-    """Rebuild the currently open report after a cost change, if one exists."""
+    """Calculate once; downloads are generated on demand, never served from cache."""
     income_path, orders_path = latest_report_paths()
     if not income_path.exists() or not orders_path.exists():
         return None
-    platform = app_state.get("active_platform", "tiktok")
-    result = analyse(income_path, orders_path, app_state, platform)
-    write_csv(result)
+    return analyse(income_path, orders_path, app_state, app_state.get("active_platform", "tiktok"))
+
+
+def commit_report_state(app_state, require_report=False):
+    # A validation/calculation failure must not save half of a user operation.
+    result = refresh_current_report(app_state)
+    if require_report and result is None:
+        raise ValueError("上传文件已不在服务器，请重新分析文件；本次修改未保存。")
+    save_state(app_state)
     return result
 
 
@@ -1269,9 +1211,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {format % args}")
 
+    def request_language(self):
+        query = parse_qs(urlparse(self.path).query)
+        return language_code(self.headers.get("X-Report-Language") or query.get("lang", ["zh"])[0])
+
     def json(self, value, status=HTTPStatus.OK):
+        if isinstance(value, dict) and "error" in value:
+            value = dict(value, error=localized_error(value["error"], self.request_language()))
         raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(raw))
         self.end_headers()
@@ -1328,25 +1277,27 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/cost-catalog":
             self.json({"items": cost_catalog(state())})
             return
-        if parsed.path == "/api/download/latest":
-            current = state()
-            current_platform = product_key(current.get("active_platform", "tiktok"))
-            filename = report_filename(current_platform)
-            income_path, orders_path = latest_report_paths()
-            if not income_path.exists() or not orders_path.exists():
-                self.json({"error": "上传文件已不在服务器，请重新分析文件。"}, HTTPStatus.NOT_FOUND)
-                return
+        if parsed.path in ("/api/download/latest", "/api/download/csv"):
             try:
-                path = write_augmented_xlsx(income_path, orders_path, current, current_platform)
+                current = state()
+                result = refresh_current_report(current)
+                if result is None:
+                    raise ValueError("上传文件已不在服务器，请重新分析文件。")
+                expected = parse_qs(parsed.query).get("revision", [""])[0]
+                if not expected or expected != result["revision"]:
+                    self.json({"error": "报表版本已改变或页面尚未更新，请重新分析或保存当前报表后再下载。"}, HTTPStatus.CONFLICT)
+                    return
+                platform = product_key(current.get("active_platform", "tiktok"))
+                excel = parsed.path.endswith("/latest")
+                path = write_report_xlsx(result, platform, self.request_language()) if excel else write_csv(result, self.request_language())
+                raw = path.read_bytes()
             except Exception as error:
-                self.json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                self.json({"error": f"下载失败：{error}。未提供旧报告。"}, HTTPStatus.BAD_REQUEST)
                 return
-            if not path.exists():
-                self.json({"error": "尚未生成报告"}, HTTPStatus.NOT_FOUND)
-                return
-            raw = path.read_bytes()
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if excel else "text/csv; charset=utf-8")
+            filename = report_filename(platform) if excel else report_filename(platform).replace(".xlsx", ".csv")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", len(raw))
             self.end_headers()
@@ -1361,21 +1312,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="cost_table_template.csv"')
-            self.send_header("Content-Length", len(raw))
-            self.end_headers()
-            self.wfile.write(raw)
-            return
-        if parsed.path == "/api/download/csv":
-            path = REPORTS / "latest_profit_report.csv"
-            if not path.exists():
-                self.json({"error": "尚未生成报告"}, HTTPStatus.NOT_FOUND)
-                return
-            raw = path.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/csv; charset=utf-8")
-            current_platform = product_key(state().get("active_platform", "tiktok"))
-            csv_filename = report_filename(current_platform).replace(".xlsx", ".csv")
-            self.send_header("Content-Disposition", f'attachment; filename="{csv_filename}"')
             self.send_header("Content-Length", len(raw))
             self.end_headers()
             self.wfile.write(raw)
@@ -1452,7 +1388,6 @@ class Handler(BaseHTTPRequestHandler):
                                 old.unlink()
                         shutil.copyfile(path, DATA / f"latest_{name}{path.suffix.lower()}")
                     save_state(current)
-                    write_csv(result)
                 self.json(result)
                 return
             if self.path == "/api/cost-table":
@@ -1498,11 +1433,14 @@ class Handler(BaseHTTPRequestHandler):
                         applied += 1
                     else:
                         stored_for_later += 1
-                save_state(current)
-                result = refresh_current_report(current)
+                result = commit_report_state(current)
                 self.json({"ok": True, "imported": imported, "applied": applied, "stored_for_later": stored_for_later, "skipped": skipped, "conflicts": conflicts, "result": result})
                 return
             payload = self.body()
+            if payload.get("expected_revision"):
+                latest = refresh_current_report(state())
+                if latest is None or payload["expected_revision"] != latest["revision"]:
+                    raise ValueError("报表已被另一页面或操作更新，本次修改未保存；请重新分析后再修改。")
             if self.path == "/api/order-override":
                 order_id = normalized_id(payload.get("order_id"))
                 if not order_id:
@@ -1523,13 +1461,7 @@ class Handler(BaseHTTPRequestHandler):
                             override[field] = strict_signed_money(value)
                 if not override:
                     current["order_overrides"].pop(order_id, None)
-                save_state(current)
-                income_path, orders_path = latest_report_paths()
-                if not income_path.exists() or not orders_path.exists():
-                    raise ValueError("请先重新分析两份 Excel。")
-                platform = current.get("active_platform", "tiktok")
-                result = analyse(income_path, orders_path, current, platform)
-                write_csv(result)
+                result = commit_report_state(current, require_report=True)
                 self.json(result)
                 return
             if self.path in ("/api/cost", "/api/cost-batch"):
@@ -1547,8 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
                 for sku_id in sku_ids:
                     entries = cost_bucket.setdefault(sku_id, [])
                     save_cost_entry(entries, amount, text(payload.get("effective_from")) or "1900/01/01", text(payload.get("note")), currency)
-                save_state(current)
-                self.json({"ok": True, "result": refresh_current_report(current)})
+                self.json({"ok": True, "result": commit_report_state(current)})
                 return
             if self.path == "/api/product-cost":
                 name = text(payload.get("product_name"))
@@ -1591,8 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
                             current["costs"][sku_id] = []
                         else:
                             current.setdefault("platform_costs", {}).setdefault(active_platform, {})[sku_id] = []
-                save_state(current)
-                self.json({"ok": True, "result": refresh_current_report(current)})
+                self.json({"ok": True, "result": commit_report_state(current)})
                 return
             if self.path == "/api/name-replace":
                 find, replace = text(payload.get("find")), text(payload.get("replace"))
@@ -1602,15 +1532,8 @@ class Handler(BaseHTTPRequestHandler):
                 rules = [rule for rule in current.setdefault("name_replacements", []) if text(rule.get("find")) != find]
                 rules.append({"find": find, "replace": replace})
                 current["name_replacements"] = rules
-                save_state(current)
-                income_path, orders_path = latest_report_paths()
-                if income_path.exists() and orders_path.exists():
-                    platform = current.get("active_platform", "tiktok")
-                    result = analyse(income_path, orders_path, current, platform)
-                    write_csv(result)
-                    self.json({"ok": True, "rules": rules, "result": result})
-                else:
-                    self.json({"ok": True, "rules": rules})
+                result = commit_report_state(current)
+                self.json({"ok": True, "rules": rules, "result": result})
                 return
             if self.path == "/api/retime-costs":
                 effective_from = text(payload.get("effective_from"))
@@ -1622,8 +1545,7 @@ class Handler(BaseHTTPRequestHandler):
                         for entry in entries:
                             entry["effective_from"] = effective_from
                             count += 1
-                save_state(current)
-                self.json({"ok": True, "count": count, "result": refresh_current_report(current)})
+                self.json({"ok": True, "count": count, "result": commit_report_state(current)})
                 return
             self.json({"error": "未知请求"}, HTTPStatus.NOT_FOUND)
         except Exception as error:
