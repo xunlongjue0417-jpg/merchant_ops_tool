@@ -924,7 +924,7 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
                 cost_total += quantity * money(cost.get("amount"))
         # Full returns have zero net units while Income may list the original
         # item. That is expected and must not hide the refund loss.
-        if settlement["details_units"] and actual_units != settlement["details_units"] and not (lifecycle["returned"] and actual_units == 0):
+        if not lifecycle["returned"] and settlement["details_units"] and actual_units != settlement["details_units"]:
             flags.append(f"数量不一致：订单 {actual_units} 件，结算详情 {settlement['details_units']} 件")
         if override_cost is not None:
             cost_total = override_cost
@@ -968,6 +968,12 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
     # `settlements` is populated in Income file order and dicts preserve that
     # order. Keep the report in that same order; the browser can still apply
     # an explicit sort when the user clicks a column header.
+    # Physical quantities come only from order lines, never repeated cash entries.
+    for row in report:
+        lines = by_order.get(row["order_id"], [])
+        lifecycle = order_lifecycle(lines)
+        row["purchased_units"] = lifecycle["gross_units"] if lines else None
+        row["returned_units"] = lifecycle["returned_units"] if lines else None
     confirmed = [row for row in report if row["profit"] is not None]
     # A negative settlement without complete costs is visible, but is NOT
     # relabelled as final profit or removed from the existing review status.
@@ -1005,8 +1011,8 @@ def analyse(income_path, orders_path, app_state, platform="tiktok"):
 
 EXPORT_FIELDS = [
     ("商品名称", "product_name"), ("规格", "variation"), ("订单", "order_id"),
-    ("币种", "currency"), ("到账", "net_settlement"), ("订单件数", "actual_units"),
-    ("结算件数", "details_units"), ("数量来源", "quantity_source"),
+    ("币种", "currency"), ("到账", "net_settlement"), ("购买件数", "purchased_units"),
+    ("退货件数", "returned_units"), ("净售件数", "actual_units"), ("数量来源", "quantity_source"),
     ("商品成本", "cost"), ("其他", "other_cost"), ("总成本", "total_cost"),
     ("纯利润", "profit"), ("状态", "status"), ("核对说明", "flags"),
     ("亏损说明", "loss_label"),
