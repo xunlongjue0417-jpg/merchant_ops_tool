@@ -182,7 +182,8 @@ window.MERCHANT_I18N = {
       "clearAllFilters": "Clear all filters",
       "shownCount": "Showing {shown} / {total} orders",
       "export_purchased_units": "Purchased units",
-      "export_returned_units": "Returned units"
+      "export_returned_units": "Returned units",
+      "replaceNoMatch": "No matching product name changed, or the name is already the same. No changes were saved."
     },
     "zh": {
       "appTitle": "商家利润核对工具",
@@ -366,7 +367,8 @@ window.MERCHANT_I18N = {
       "clearAllFilters": "清除全部筛选",
       "shownCount": "显示 {shown} / {total} 笔订单",
       "export_purchased_units": "购买件数",
-      "export_returned_units": "退货件数"
+      "export_returned_units": "退货件数",
+      "replaceNoMatch": "没有找到可替换的商品名称，或名称已经相同；本次没有保存修改。"
     },
     "ms": {
       "appTitle": "Penyemak Untung Penjual",
@@ -550,7 +552,8 @@ window.MERCHANT_I18N = {
       "clearAllFilters": "Kosongkan semua penapis",
       "shownCount": "Memaparkan {shown} / {total} pesanan",
       "export_purchased_units": "Unit dibeli",
-      "export_returned_units": "Unit dipulangkan"
+      "export_returned_units": "Unit dipulangkan",
+      "replaceNoMatch": "Tiada nama produk sepadan yang berubah, atau nama sudah sama. Tiada perubahan disimpan."
     }
   },
   "system": [
