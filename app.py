@@ -262,7 +262,10 @@ def display_product_name(value, app_state):
     for rule in app_state.get("name_replacements", []):
         old = text(rule.get("find"))
         if old:
-            result = result.replace(old, text(rule.get("replace")))
+            # Treat whitespace from exports/pasted names equivalently, but keep
+            # punctuation and case literal. Apply per product, before joining lines.
+            pattern = r"\s+".join(re.escape(part) for part in old.split())
+            result = re.sub(pattern, lambda match: text(rule.get("replace")), result)
     return result
 
 
@@ -1536,10 +1539,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请填写要查找的商品名称文字。")
                 current = state()
                 rules = [rule for rule in current.setdefault("name_replacements", []) if text(rule.get("find")) != find]
+                before = refresh_current_report(current)
                 rules.append({"find": find, "replace": replace})
                 current["name_replacements"] = rules
-                result = commit_report_state(current)
-                self.json({"ok": True, "rules": rules, "result": result})
+                result = refresh_current_report(current)
+                previous = {row["order_id"]: row["product_name"] for row in (before or {}).get("orders", [])}
+                changed = sum(previous.get(row["order_id"]) != row["product_name"] for row in (result or {}).get("orders", []))
+                if changed:
+                    save_state(current)
+                self.json({"ok": bool(changed), "changed_orders": changed, "result": result if changed else before})
                 return
             if self.path == "/api/retime-costs":
                 effective_from = text(payload.get("effective_from"))
